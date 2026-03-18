@@ -1,0 +1,28 @@
+{
+  "name": "claude-lean4-lsp",
+  "plugins": [
+    {
+      "name": "claude-lean4-lsp",
+      "description": "Lean 4 language server integration for Claude Code — diagnostics, hover info, go-to-definition, and completions for .lean files",
+      "version": "0.1.0",
+      "author": {
+        "name": "Yingte Xu",
+        "email": "lucianoxu@foxmail.com"
+      },
+      "source": "./plugins/lean4-lsp",
+      "category": "development",
+      "strict": false,
+      "lspServers": {
+        "lean": {
+          "command": "lake",
+          "args": ["serve"],
+          "extensionToLanguage": {
+            ".lean": "lean"
+          },
+          "startupTimeout": 60000,
+          "maxRestarts": 3
+        }
+      }
+    }
+  ]
+}
