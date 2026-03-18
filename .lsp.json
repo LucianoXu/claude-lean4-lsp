@@ -1,7 +1,7 @@
 {
   "lean": {
-    "command": "lean",
-    "args": ["--server"],
+    "command": "lake",
+    "args": ["serve"],
     "transport": "stdio",
     "extensionToLanguage": {
       ".lean": "lean"

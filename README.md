@@ -6,7 +6,7 @@ Provides diagnostics, hover info, go-to-definition, and completions for `.lean` 
 
 ## Prerequisites
 
-- [Lean 4](https://lean-lang.org/lean4/doc/setup.html) installed and `lean` available on your `PATH`
+- [Lean 4](https://lean-lang.org/lean4/doc/setup.html) installed with [Lake](https://github.com/leanprover/lean4/tree/master/src/lake) (included in standard Lean 4 installation)
 - [Claude Code](https://claude.ai/claude-code) CLI
 
 ## Installation
@@ -21,8 +21,8 @@ Or add the LSP configuration manually to your project's `.claude/settings.json`:
 {
   "lspServers": {
     "lean": {
-      "command": "lean",
-      "args": ["--server"],
+      "command": "lake",
+      "args": ["serve"],
       "transport": "stdio",
       "extensionToLanguage": {
         ".lean": "lean"
@@ -37,17 +37,17 @@ Or add the LSP configuration manually to your project's `.claude/settings.json`:
 }
 ```
 
-## Lake Projects
+The default uses `lake serve`, which respects your project's `lean-toolchain` file and resolves Lake dependencies (e.g., Mathlib) automatically. This is the same approach used by VS Code's Lean extension.
 
-For projects managed by [Lake](https://github.com/leanprover/lean4/tree/master/src/lake) (with a `lakefile.lean`), you may prefer using `lake serve` instead of `lean --server`. This ensures the language server uses the correct toolchain and resolves dependencies automatically.
+## Standalone Files (No Lake Project)
 
-To use `lake serve`, replace the command in the configuration:
+If you are working with standalone `.lean` files outside a Lake project, use `lean --server` instead:
 
 ```json
 {
   "lean": {
-    "command": "lake",
-    "args": ["serve"],
+    "command": "lean",
+    "args": ["--server"],
     "transport": "stdio",
     "extensionToLanguage": {
       ".lean": "lean"
