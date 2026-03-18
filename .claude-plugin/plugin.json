@@ -2,9 +2,11 @@
   "name": "claude-lean4-lsp",
   "version": "0.1.0",
   "source": "./claude-lean4-lsp",
-  "description": "Lean 4 language server integration for Claude Code — provides diagnostics, hover info, go-to-definition, and completions for .lean files",
+  "description": "Lean 4 language server integration for Claude Code — provides diagnostics, hover info, go-to-definition, and completions for .lean files. Supports both Lake projects (lake serve) and standalone files (lean --server).",
   "category": "development",
-  "tags": ["lean", "lean4", "theorem-proving", "mathematics", "formal-verification"],
+  "tags": ["lean", "lean4", "theorem-proving", "mathematics", "formal-verification", "interactive-proving"],
+  "repository": "https://github.com/LucianoXu/claude-lean4-lsp",
+  "license": "MIT",
   "author": {
     "name": "Yingte Xu",
     "email": "lucianoxu@foxmail.com"
@@ -13,6 +15,19 @@
     "lean": {
       "command": "lake",
       "args": ["serve"],
+      "transport": "stdio",
+      "extensionToLanguage": {
+        ".lean": "lean"
+      },
+      "initializationOptions": {},
+      "settings": {},
+      "maxRestarts": 3,
+      "startupTimeout": 60000,
+      "shutdownTimeout": 15000
+    },
+    "lean-standalone": {
+      "command": "lean",
+      "args": ["--server"],
       "transport": "stdio",
       "extensionToLanguage": {
         ".lean": "lean"

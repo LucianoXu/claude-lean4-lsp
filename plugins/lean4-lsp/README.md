@@ -2,7 +2,16 @@
 
 Lean 4 language server plugin for [Claude Code](https://claude.ai/claude-code).
 
-Provides diagnostics, hover info, go-to-definition, and completions for `.lean` files via the Lean 4 built-in language server.
+Provides diagnostics, hover info, go-to-definition, and completions for `.lean` files via the Lean 4 built-in language server. This plugin brings the same real-time feedback mathematicians rely on in VS Code directly into Claude Code, reducing the effort of interactive theorem proving by surfacing type errors, unsolved goals, and `sorry` markers as you work.
+
+## Two LSP Server Modes
+
+This plugin provides two approaches to start the Lean 4 language server:
+
+| Mode | Command | Best For |
+|------|---------|----------|
+| **Lake** (default) | `lake serve` | Lake projects with dependencies (e.g., Mathlib) |
+| **Lean** (standalone) | `lean --server` | Standalone `.lean` files outside Lake projects |
 
 ## Prerequisites
 
@@ -11,10 +20,14 @@ Provides diagnostics, hover info, go-to-definition, and completions for `.lean` 
 
 ## Installation
 
-### Option 1: From a Marketplace (after submission)
+### Option 1: From a Marketplace
 
 ```bash
-claude plugin install claude-lean4-lsp
+# For Lake projects (recommended for most users):
+claude plugin install lean4-lake-lsp
+
+# For standalone .lean files:
+claude plugin install lean4-lean-lsp
 ```
 
 ### Option 2: Local Plugin (single session)
@@ -28,7 +41,9 @@ claude --plugin-dir ./claude-lean4-lsp
 
 ### Option 3: Manual Configuration (persistent)
 
-Add the LSP configuration directly to your project's `.claude/settings.json`:
+Add the LSP configuration directly to your project's `.claude/settings.json`.
+
+**Using `lake serve`** (for Lake projects):
 
 ```json
 {
@@ -50,29 +65,31 @@ Add the LSP configuration directly to your project's `.claude/settings.json`:
 }
 ```
 
-The default uses `lake serve`, which respects your project's `lean-toolchain` file and resolves Lake dependencies (e.g., Mathlib) automatically. This is the same approach used by VS Code's Lean extension.
+`lake serve` respects your project's `lean-toolchain` file and resolves Lake dependencies (e.g., Mathlib) automatically. This is the same approach used by VS Code's Lean extension.
 
-## Standalone Files (No Lake Project)
-
-If you are working with standalone `.lean` files outside a Lake project, use `lean --server` instead:
+**Using `lean --server`** (for standalone files):
 
 ```json
 {
-  "lean": {
-    "command": "lean",
-    "args": ["--server"],
-    "transport": "stdio",
-    "extensionToLanguage": {
-      ".lean": "lean"
-    },
-    "initializationOptions": {},
-    "settings": {},
-    "maxRestarts": 3,
-    "startupTimeout": 60000,
-    "shutdownTimeout": 15000
+  "lspServers": {
+    "lean": {
+      "command": "lean",
+      "args": ["--server"],
+      "transport": "stdio",
+      "extensionToLanguage": {
+        ".lean": "lean"
+      },
+      "initializationOptions": {},
+      "settings": {},
+      "maxRestarts": 3,
+      "startupTimeout": 60000,
+      "shutdownTimeout": 15000
+    }
   }
 }
 ```
+
+Use `lean --server` when working with standalone `.lean` files that are not part of a Lake project.
 
 ## What You Get
 
