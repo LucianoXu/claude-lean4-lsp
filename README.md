@@ -1,4 +1,4 @@
-# lean4-lsp
+# claude-lean4-lsp
 
 Lean 4 language server plugin for [Claude Code](https://claude.ai/claude-code).
 
