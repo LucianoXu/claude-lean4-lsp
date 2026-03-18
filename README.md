@@ -11,11 +11,24 @@ Provides diagnostics, hover info, go-to-definition, and completions for `.lean` 
 
 ## Installation
 
+### Option 1: From a Marketplace (after submission)
+
 ```bash
-claude plugin add /path/to/lean4-lsp
+claude plugin install claude-lean4-lsp
 ```
 
-Or add the LSP configuration manually to your project's `.claude/settings.json`:
+### Option 2: Local Plugin (single session)
+
+Clone or download this repository, then launch Claude Code with the `--plugin-dir` flag:
+
+```bash
+git clone https://github.com/LucianoXu/claude-lean4-lsp.git
+claude --plugin-dir ./claude-lean4-lsp
+```
+
+### Option 3: Manual Configuration (persistent)
+
+Add the LSP configuration directly to your project's `.claude/settings.json`:
 
 ```json
 {
