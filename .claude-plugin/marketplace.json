@@ -1,5 +1,11 @@
 {
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "claude-lean4-lsp",
+  "description": "Lean 4 language server plugin for Claude Code",
+  "owner": {
+    "name": "Yingte Xu",
+    "email": "lucianoxu@foxmail.com"
+  },
   "plugins": [
     {
       "name": "claude-lean4-lsp",
