@@ -1,0 +1,15 @@
+{
+  "lean": {
+    "command": "lean",
+    "args": ["--server"],
+    "transport": "stdio",
+    "extensionToLanguage": {
+      ".lean": "lean"
+    },
+    "initializationOptions": {},
+    "settings": {},
+    "maxRestarts": 3,
+    "startupTimeout": 60000,
+    "shutdownTimeout": 15000
+  }
+}
