@@ -1,110 +1,71 @@
-# claude-lean4-lsp
+# lean4-lsp
 
-Lean 4 language server plugin for [Claude Code](https://claude.ai/claude-code).
+Lean 4 language server plugin for [Claude Code](https://claude.com/claude-code) — with automatic project-root detection, toolchain resolution, and interactive proof-state queries.
 
-Provides diagnostics, hover info, go-to-definition, and completions for `.lean` files via the Lean 4 built-in language server. This plugin brings the same real-time feedback mathematicians rely on in VS Code directly into Claude Code, reducing the effort of interactive theorem proving by surfacing type errors, unsolved goals, and `sorry` markers as you work.
+## Why this exists
 
-## Two LSP Server Modes
+Claude Code launches LSP servers from the **session root**. Lean's server must run from the **Lake project root** (where `lakefile.toml` and `lean-toolchain` live) — otherwise imports don't resolve and the wrong toolchain is used. A naive `"command": "lake serve"` config only works when you happen to open Claude Code exactly at the project root.
 
-This plugin provides two approaches to start the Lean 4 language server:
+This plugin fixes that with a launcher proxy, and goes further:
 
-| Mode | Command | Best For |
-|------|---------|----------|
-| **Lake** (default) | `lake serve` | Lake projects with dependencies (e.g., Mathlib) |
-| **Lean** (standalone) | `lean --server` | Standalone `.lean` files outside Lake projects |
+- **Automatic project-root detection** — on every file open, walks up from the `.lean` file to the nearest `lakefile.toml`/`lakefile.lean` and runs `lake serve` there. Dependency sources under `.lake/packages/` are correctly served by the outer project. Standalone files (no lakefile) get `lean --server`. One plugin covers both modes — no need to choose at install time.
+- **Multi-project sessions** — files from different Lake projects in one session each get their own correctly-rooted server; requests are routed per document.
+- **elan discovery** — finds `lake`/`lean` via PATH, `$ELAN_HOME/bin`, or `~/.elan/bin`, so it works even when elan's bin dir was never added to PATH. Overridable with `LEAN4_LSP_LAKE` / `LEAN4_LSP_LEAN`.
+- **Interactive proof states** — the bundled `lean-goal` CLI exposes Lean's `$/lean/plainGoal`, which generic LSP clients cannot reach: goals at any position, the goal at every `sorry`, and fast per-file diagnostics, backed by a warm background server.
+- **Clear failures** — a missing toolchain produces an actionable message (what was searched, how to install), not a bare `ENOENT`.
 
 ## Prerequisites
 
-- [Lean 4](https://lean-lang.org/lean4/doc/setup.html) installed with [Lake](https://github.com/leanprover/lean4/tree/master/src/lake) (included in standard Lean 4 installation)
-- [Claude Code](https://claude.ai/claude-code) CLI
+- [Lean 4 via elan](https://lean-lang.org/lean4/doc/setup.html)
+- Node.js ≥ 18 (or Bun/Deno) — used by the launcher; without any JS runtime the plugin degrades to a plain server with PATH fixes only
+- Claude Code ≥ 2.1
 
 ## Installation
 
-### Option 1: From a Marketplace
-
 ```bash
-# For Lake projects (recommended for most users):
-claude plugin install lean4-lake-lsp
-
-# For standalone .lean files:
-claude plugin install lean4-lean-lsp
+claude plugin marketplace add LucianoXu/claude-lean4-lsp
+claude plugin install lean4-lsp@claude-lean4-lsp
 ```
 
-### Option 2: Local Plugin (single session)
+Or for a single session from a checkout: `claude --plugin-dir ./claude-lean4-lsp/plugins/lean4-lsp`
 
-Clone or download this repository, then launch Claude Code with the `--plugin-dir` flag:
+> Upgrading from `lean4-lake-lsp` / `lean4-lean-lsp` (≤ 0.1.0): uninstall both — this plugin replaces the pair, and Claude Code lets only one server claim `.lean` files anyway.
 
-```bash
-git clone https://github.com/LucianoXu/claude-lean4-lsp.git
-claude --plugin-dir ./claude-lean4-lsp
+## What you get
+
+**Automatically, after every edit to a `.lean` file** — diagnostics from the live server: type errors, unsolved goals, sorry warnings. No `lake build` round-trips while iterating.
+
+**Via the LSP tool** — hover (types + docstrings), go-to-definition (including into Mathlib sources), find-references, document/workspace symbols, call hierarchy.
+
+**Via `lean-goal`** (on PATH in Claude Code's Bash tool):
+
+```
+lean-goal goal Formalization/Closure.lean:42:7    # tactic goals at a position
+lean-goal sorries Formalization/Closure.lean      # every sorry, with its goal
+lean-goal check Formalization/Closure.lean        # elaborate + diagnostics, in seconds
+lean-goal status                                  # warm servers
+lean-goal stop                                    # free their memory
 ```
 
-### Option 3: Manual Configuration (persistent)
+Positions are 1-based. Without a column, the position defaults to the first `sorry` on the line. The first query on a project starts a background server (up to ~1 min with Mathlib imports); subsequent queries are near-instant. Daemons idle out after 30 minutes.
 
-Add the LSP configuration directly to your project's `.claude/settings.json`.
+A bundled skill (`lean-interactive-proving`) teaches Claude the sorry-driven workflow: `sorries` → edit → `check` → `lake build` as the final gate.
 
-**Using `lake serve`** (for Lake projects):
+## Configuration (environment variables)
 
-```json
-{
-  "lspServers": {
-    "lean": {
-      "command": "lake",
-      "args": ["serve"],
-      "transport": "stdio",
-      "extensionToLanguage": {
-        ".lean": "lean"
-      },
-      "initializationOptions": {},
-      "settings": {},
-      "maxRestarts": 3,
-      "startupTimeout": 60000,
-      "shutdownTimeout": 15000
-    }
-  }
-}
-```
-
-`lake serve` respects your project's `lean-toolchain` file and resolves Lake dependencies (e.g., Mathlib) automatically. This is the same approach used by VS Code's Lean extension.
-
-**Using `lean --server`** (for standalone files):
-
-```json
-{
-  "lspServers": {
-    "lean": {
-      "command": "lean",
-      "args": ["--server"],
-      "transport": "stdio",
-      "extensionToLanguage": {
-        ".lean": "lean"
-      },
-      "initializationOptions": {},
-      "settings": {},
-      "maxRestarts": 3,
-      "startupTimeout": 60000,
-      "shutdownTimeout": 15000
-    }
-  }
-}
-```
-
-Use `lean --server` when working with standalone `.lean` files that are not part of a Lake project.
-
-## What You Get
-
-After installation, Claude Code will automatically:
-
-- **Diagnostics**: See type errors, unsolved goals, and `sorry` markers after each file edit — no need to run `lake build` manually
-- **Hover info**: Get type signatures and documentation for any identifier
-- **Go-to-definition**: Navigate to source definitions across files and dependencies
-- **Completions**: Get autocomplete suggestions while editing Lean code
+| Variable | Effect |
+|----------|--------|
+| `LEAN4_LSP_LAKE` / `LEAN4_LSP_LEAN` | Absolute paths overriding binary discovery |
+| `LEAN4_LSP_MODE=lake\|lean` | Force one server mode for all files |
+| `LEAN4_LSP_DEBUG=1` | Verbose proxy routing log on stderr |
+| `LEAN4_LSP_IDLE_MS` | lean-goal daemon idle timeout (default 30 min) |
+| `LEAN4_LSP_TIMEOUT_MS` | lean-goal query timeout (default 5 min) |
 
 ## Notes
 
-- **Startup time**: Lean's language server can take 10-60 seconds to initialize, especially for projects importing Mathlib. The default `startupTimeout` of 60 seconds accommodates this.
-- **Memory usage**: Lean's server can use significant memory (2-8 GB) depending on your project's dependencies. Ensure sufficient RAM is available.
-- **Goal state**: Standard LSP diagnostics will show errors and unsolved goals. For interactive tactic goal states (like VS Code's Lean Infoview), consider pairing this plugin with the [lean-lsp-mcp](https://github.com/leanprover/lean-lsp-mcp) MCP server.
+- **Memory**: each project's server can use significant RAM (Mathlib: several GB). `lean-goal stop` and closing the session both free it.
+- **Final verification**: the language server reflects live editor state; `lake build` remains the ground truth for CI-grade acceptance.
+- **Development**: `node test/run-tests.mjs` runs the full suite (framing, root detection, proxy routing, and live `lean-goal` tests when a toolchain is installed).
 
 ## License
 

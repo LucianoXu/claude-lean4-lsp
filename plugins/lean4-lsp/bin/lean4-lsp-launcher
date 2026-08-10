@@ -1,0 +1,38 @@
+#!/bin/sh
+# Entry point Claude Code runs for the lean4-lsp plugin (see .lsp.json).
+# Prefers the smart proxy (project-root detection, toolchain resolution,
+# multi-project routing) on any available JS runtime; degrades to a plain
+# `lake serve` / `lean --server` with PATH fixes when no runtime exists.
+
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+for rt in node bun deno; do
+  if command -v "$rt" >/dev/null 2>&1; then
+    case "$rt" in
+      deno) exec "$rt" run --allow-all "$DIR/lsp-proxy.mjs" "$@" ;;
+      *)    exec "$rt" "$DIR/lsp-proxy.mjs" "$@" ;;
+    esac
+  fi
+done
+
+echo "lean4-lsp: no node/bun/deno found — falling back to a plain Lean server without project-root detection" >&2
+
+[ -n "$ELAN_HOME" ] && [ -d "$ELAN_HOME/bin" ] && PATH="$ELAN_HOME/bin:$PATH"
+[ -d "$HOME/.elan/bin" ] && PATH="$HOME/.elan/bin:$PATH"
+export PATH
+
+# Best-effort root detection without the proxy: if the working directory has
+# no lakefile, descend to the first Lake project found up to 3 levels down.
+if [ ! -f lakefile.toml ] && [ ! -f lakefile.lean ]; then
+  found=$(find . -maxdepth 3 \( -name lakefile.toml -o -name lakefile.lean \) -not -path '*/.lake/*' 2>/dev/null | head -1)
+  [ -n "$found" ] && cd "$(dirname "$found")"
+fi
+
+if command -v lake >/dev/null 2>&1 && { [ -f lakefile.toml ] || [ -f lakefile.lean ]; }; then
+  exec lake serve
+fi
+if command -v lean >/dev/null 2>&1; then
+  exec lean --server
+fi
+echo "lean4-lsp: no Lean toolchain found. Install elan: https://lean-lang.org/lean4/doc/setup.html" >&2
+exit 127

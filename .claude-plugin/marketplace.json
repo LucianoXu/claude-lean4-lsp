@@ -1,63 +1,34 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "claude-lean4-lsp",
-  "description": "Lean 4 language server plugin for Claude Code — enables diagnostics, hover info, go-to-definition, and completions for interactive theorem proving in .lean files",
+  "description": "Lean 4 language server plugin for Claude Code — automatic Lake project-root detection, elan toolchain resolution, multi-project routing, live diagnostics, and interactive proof-state queries via the bundled lean-goal CLI.",
   "owner": {
     "name": "Yingte Xu",
     "email": "lucianoxu@foxmail.com"
   },
   "plugins": [
     {
-      "name": "lean4-lake-lsp",
-      "description": "Lean 4 language server via Lake — for Lake projects with dependencies (e.g., Mathlib). Provides diagnostics, hover info, go-to-definition, and completions for .lean files.",
-      "version": "0.1.0",
+      "name": "lean4-lsp",
+      "description": "Lean 4 language server with automatic Lake project-root detection (works even when the session root is above the project), elan toolchain resolution, and multi-project routing. Bundles the lean-goal CLI for proof-goal state, sorry inventory, and fast diagnostics — plus a skill teaching the interactive proving workflow.",
+      "version": "0.2.0",
       "author": {
         "name": "Yingte Xu",
         "email": "lucianoxu@foxmail.com"
       },
       "source": "./plugins/lean4-lsp",
       "category": "development",
-      "tags": ["lean", "lean4", "theorem-proving", "mathematics", "formal-verification", "lake"],
+      "tags": [
+        "lean",
+        "lean4",
+        "theorem-proving",
+        "mathematics",
+        "formal-verification",
+        "lake",
+        "interactive-proving"
+      ],
       "repository": "https://github.com/LucianoXu/claude-lean4-lsp",
       "license": "MIT",
-      "strict": false,
-      "lspServers": {
-        "lean": {
-          "command": "lake",
-          "args": ["serve"],
-          "extensionToLanguage": {
-            ".lean": "lean"
-          },
-          "startupTimeout": 60000,
-          "maxRestarts": 3
-        }
-      }
-    },
-    {
-      "name": "lean4-lean-lsp",
-      "description": "Lean 4 language server via the lean binary — for standalone .lean files outside Lake projects. Provides diagnostics, hover info, go-to-definition, and completions.",
-      "version": "0.1.0",
-      "author": {
-        "name": "Yingte Xu",
-        "email": "lucianoxu@foxmail.com"
-      },
-      "source": "./plugins/lean4-lsp",
-      "category": "development",
-      "tags": ["lean", "lean4", "theorem-proving", "mathematics", "formal-verification", "standalone"],
-      "repository": "https://github.com/LucianoXu/claude-lean4-lsp",
-      "license": "MIT",
-      "strict": false,
-      "lspServers": {
-        "lean": {
-          "command": "lean",
-          "args": ["--server"],
-          "extensionToLanguage": {
-            ".lean": "lean"
-          },
-          "startupTimeout": 60000,
-          "maxRestarts": 3
-        }
-      }
+      "strict": false
     }
   ]
 }

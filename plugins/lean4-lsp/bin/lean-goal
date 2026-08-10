@@ -1,0 +1,10 @@
+#!/bin/sh
+# lean-goal — Lean 4 proof-state queries. Implementation lives in lean-goal.mjs.
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+for rt in node bun; do
+  if command -v "$rt" >/dev/null 2>&1; then
+    exec "$rt" "$DIR/lean-goal.mjs" "$@"
+  fi
+done
+echo "lean-goal: requires node or bun on PATH" >&2
+exit 127
