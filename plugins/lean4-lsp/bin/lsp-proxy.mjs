@@ -20,12 +20,39 @@
 
 import { spawn } from 'node:child_process';
 import path from 'node:path';
+import { appendFileSync as fsAppend } from 'node:fs';
 import {
   findLakeRoot, resolveToolchain, LspFramer, frameMessage, uriToPath, pathToUri,
 } from './lean-lsp-lib.mjs';
 
 const DEBUG = !!process.env.LEAN4_LSP_DEBUG;
-const log = (...a) => { if (DEBUG) process.stderr.write(`[lean4-lsp] ${a.join(' ')}\n`); };
+const LOG_FILE = process.env.LEAN4_LSP_LOG_FILE;
+const log = (...a) => {
+  const line = `[lean4-lsp] ${a.join(' ')}\n`;
+  if (DEBUG) process.stderr.write(line);
+  if (LOG_FILE) { try { fsAppend(LOG_FILE, `${new Date().toISOString()} ${line}`); } catch {} }
+};
+// Wire-level trace (only when LEAN4_LSP_LOG_FILE is set): every message that
+// crosses the proxy, with direction, method/id and a result digest — enough
+// to tell a client that never asked from a server that answered empty.
+function traceMsg(dir, msg) {
+  if (!LOG_FILE) return;
+  let extra = '';
+  if (msg.method === undefined && msg.result !== undefined) {
+    const r = msg.result;
+    extra = Array.isArray(r) ? ` results=${r.length}`
+      + (r.length ? ` first=${JSON.stringify(r[0]).slice(0, 160)}` : '')
+      : ` result=${JSON.stringify(r).slice(0, 160)}`;
+  } else if (msg.error) {
+    extra = ` error=${JSON.stringify(msg.error).slice(0, 160)}`;
+  } else if (msg.params && msg.params.position) {
+    extra = ` pos=${msg.params.position.line}:${msg.params.position.character}`
+      + ` uri=${(msg.params.textDocument || {}).uri || ''}`;
+  } else if (msg.params && msg.params.query !== undefined) {
+    extra = ` query=${JSON.stringify(msg.params.query)}`;
+  }
+  log(`${dir} ${msg.method || 'response'}${msg.id !== undefined ? `#${msg.id}` : ''}${extra}`);
+}
 
 const toolchain = resolveToolchain(process.env);
 
@@ -53,7 +80,10 @@ const STATIC_CAPABILITIES = {
 };
 
 const client = {
-  send(obj) { process.stdout.write(frameMessage({ jsonrpc: '2.0', ...obj })); },
+  send(obj) {
+    traceMsg('proxy→client', obj);
+    process.stdout.write(frameMessage({ jsonrpc: '2.0', ...obj }));
+  },
   respond(id, result) { this.send({ id, result }); },
   respondError(id, message, code = -32603) { this.send({ id, error: { code, message } }); },
   showMessage(message, type = 1) {
@@ -72,6 +102,22 @@ const srvReqMap = new Map();   // remapped id -> { server, origId } for server->
 let srvReqSeq = 1;
 
 const BROADCAST_METHODS = new Set(['workspace/symbol']);
+
+// The Lean watchdog loads its .ilean index asynchronously after startup
+// (5–20 s for a Mathlib-sized workspace), and position requests can resolve
+// empty while a file is still elaborating. During that warm-up window an
+// empty result usually means "not ready yet", not "nothing there" — so
+// retry a few times before letting an empty answer through.
+const WARMUP_MS = parseInt(process.env.LEAN4_LSP_WARMUP_MS || '', 10) || 45000;
+const RETRY_MS = parseInt(process.env.LEAN4_LSP_RETRY_MS || '', 10) || 2000;
+const MAX_RETRIES = 3;
+const RETRYABLE = new Set([
+  'textDocument/definition', 'textDocument/declaration', 'textDocument/typeDefinition',
+  'textDocument/references', 'textDocument/implementation', 'textDocument/documentSymbol',
+  'workspace/symbol',
+]);
+const isEmptyResult = (msg) => !msg.error
+  && (msg.result === null || (Array.isArray(msg.result) && msg.result.length === 0));
 
 function toolchainHint() {
   return 'lean4-lsp: no usable Lean toolchain found. Install elan '
@@ -102,7 +148,7 @@ function ensureServer(filePath) {
   const args = spec.mode === 'lake' ? ['serve'] : ['--server'];
 
   srv = {
-    key: spec.key, mode: spec.mode, cwd: spec.cwd,
+    key: spec.key, mode: spec.mode, cwd: spec.cwd, spawnedAt: Date.now(),
     state: 'starting', proc: null, queue: [], inflight: new Set(), warnedDead: false,
   };
   servers.set(spec.key, srv);
@@ -181,6 +227,7 @@ function failServer(srv, reason) {
 }
 
 function onServerMessage(srv, msg) {
+  traceMsg(`server(${path.basename(srv.cwd)})→proxy`, msg);
   // Response to our synthetic initialize: finish the handshake, flush queue.
   if (msg.id === srv.initId && !msg.method) {
     if (msg.error) {
@@ -216,9 +263,25 @@ function onServerMessage(srv, msg) {
       route.pending.delete(srv.key);
       if (!msg.error && Array.isArray(msg.result)) route.results.push(...msg.result);
       if (route.pending.size === 0) {
+        const targets = route.targets && route.targets.filter((s) => s.state === 'ready');
+        if (route.results.length === 0 && targets && targets.length
+            && (route.retries || 0) < MAX_RETRIES
+            && targets.some((s) => Date.now() - s.spawnedAt < WARMUP_MS)) {
+          route.retries = (route.retries || 0) + 1;
+          route.pending = new Set(targets.map((s) => s.key));
+          setTimeout(() => { for (const s of targets) writeTo(s, route.msg); }, RETRY_MS);
+          return;
+        }
         client.respond(msg.id, route.results);
         reqRoutes.delete(msg.id);
       }
+    } else if (route && RETRYABLE.has(route.msg && route.msg.method) && isEmptyResult(msg)
+        && srv.state === 'ready' && Date.now() - srv.spawnedAt < WARMUP_MS
+        && (route.retries || 0) < MAX_RETRIES) {
+      route.retries = (route.retries || 0) + 1;
+      log(`retry ${route.retries}/${MAX_RETRIES} for ${route.msg.method}#${msg.id} (warm-up empty)`);
+      setTimeout(() => writeTo(srv, route.msg), RETRY_MS);
+      return;
     } else {
       client.send(msg);
       reqRoutes.delete(msg.id);
@@ -239,7 +302,7 @@ function routeToServer(srv, msg) {
     return;
   }
   if (msg.id !== undefined) {
-    reqRoutes.set(msg.id, { srv });
+    reqRoutes.set(msg.id, { srv, msg });
     srv.inflight.add(msg.id);
   }
   if (srv.state === 'starting') srv.queue.push(msg);
@@ -304,7 +367,7 @@ function onClientMessage(msg) {
   if (BROADCAST_METHODS.has(msg.method) && msg.id !== undefined) {
     const live = [...servers.values()].filter((s) => s.state === 'ready' || s.state === 'starting');
     if (live.length === 0) { client.respond(msg.id, []); return; }
-    reqRoutes.set(msg.id, { broadcast: true, pending: new Set(live.map((s) => s.key)), results: [] });
+    reqRoutes.set(msg.id, { broadcast: true, pending: new Set(live.map((s) => s.key)), results: [], msg, targets: live });
     for (const srv of live) {
       if (srv.state === 'starting') srv.queue.push(msg); else writeTo(srv, msg);
       srv.inflight.add(msg.id);
@@ -345,6 +408,7 @@ function onClientMessage(msg) {
 
 const stdinFramer = new LspFramer();
 stdinFramer.onMessage = (m) => {
+  traceMsg('client→proxy', m);
   try { onClientMessage(m); } catch (e) {
     process.stderr.write(`[lean4-lsp] internal error: ${e.stack || e}\n`);
     if (m && m.id !== undefined && m.method) client.respondError(m.id, `lean4-lsp internal error: ${e.message}`);

@@ -1,6 +1,6 @@
 {
   "name": "lean4-lsp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Lean 4 language server for Claude Code with automatic Lake project-root detection, elan toolchain resolution, multi-project routing, and the lean-goal CLI for interactive proof-state queries ($/lean/plainGoal).",
   "author": {
     "name": "Yingte Xu",

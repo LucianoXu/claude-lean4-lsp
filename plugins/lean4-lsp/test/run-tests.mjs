@@ -202,6 +202,31 @@ test('proxy: workspace/symbol broadcasts and merges results', async () => {
   } finally { c.kill(); }
 });
 
+test('proxy: retries empty results while the server is warming up', async () => {
+  const c = mockClient({ MOCK_EMPTY_FIRST: '2', LEAN4_LSP_RETRY_MS: '200' });
+  try {
+    await c.request('initialize', { processId: null, rootUri: pathToUri(FIXTURES), capabilities: {} }, 5000);
+    c.notify('initialized', {});
+    const file = path.join(FIXTURES, 'lakeproj/Lakeproj/A.lean');
+    c.notify('textDocument/didOpen', openParams(file));
+    const resp = await c.request('textDocument/documentSymbol', { textDocument: { uri: pathToUri(file) } }, 10000);
+    assert.equal(resp.result[0].name, `sym@${path.join(FIXTURES, 'lakeproj')}`,
+      'real result delivered after the cold-start empties');
+  } finally { c.kill(); }
+});
+
+test('proxy: genuinely empty results still arrive after bounded retries', async () => {
+  const c = mockClient({ MOCK_EMPTY_FIRST: '99', LEAN4_LSP_RETRY_MS: '200' });
+  try {
+    await c.request('initialize', { processId: null, rootUri: pathToUri(FIXTURES), capabilities: {} }, 5000);
+    c.notify('initialized', {});
+    const file = path.join(FIXTURES, 'lakeproj/Lakeproj/A.lean');
+    c.notify('textDocument/didOpen', openParams(file));
+    const resp = await c.request('textDocument/documentSymbol', { textDocument: { uri: pathToUri(file) } }, 10000);
+    assert.deepEqual(resp.result, [], 'empty passes through once retries are exhausted');
+  } finally { c.kill(); }
+});
+
 test('proxy: missing toolchain produces a clear showMessage, not a hang', async () => {
   const emptyHome = fs.mkdtempSync(path.join(os.tmpdir(), 'lean-lsp-nohome-'));
   const c = new LspTestClient(process.execPath, [PROXY], {

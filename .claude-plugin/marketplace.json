@@ -10,7 +10,7 @@
     {
       "name": "lean4-lsp",
       "description": "Lean 4 language server with automatic Lake project-root detection (works even when the session root is above the project), elan toolchain resolution, and multi-project routing. Bundles the lean-goal CLI for proof-goal state, sorry inventory, and fast diagnostics — plus a skill teaching the interactive proving workflow.",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "author": {
         "name": "Yingte Xu",
         "email": "lucianoxu@foxmail.com"

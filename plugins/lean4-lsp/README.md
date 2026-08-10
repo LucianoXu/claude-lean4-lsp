@@ -58,11 +58,14 @@ A bundled skill (`lean-interactive-proving`) teaches Claude the sorry-driven wor
 | `LEAN4_LSP_LAKE` / `LEAN4_LSP_LEAN` | Absolute paths overriding binary discovery |
 | `LEAN4_LSP_MODE=lake\|lean` | Force one server mode for all files |
 | `LEAN4_LSP_DEBUG=1` | Verbose proxy routing log on stderr |
+| `LEAN4_LSP_LOG_FILE` | Wire-level trace of all LSP traffic to a file (debugging) |
+| `LEAN4_LSP_WARMUP_MS` / `LEAN4_LSP_RETRY_MS` | Cold-start empty-result retry window / delay (defaults 45 s / 2 s) |
 | `LEAN4_LSP_IDLE_MS` | lean-goal daemon idle timeout (default 30 min) |
 | `LEAN4_LSP_TIMEOUT_MS` | lean-goal query timeout (default 5 min) |
 
 ## Notes
 
+- **Cold start**: the Lean watchdog loads its `.ilean` index asynchronously (5–20 s for a Mathlib-sized workspace), during which definition/symbol queries would return empty. The proxy absorbs this by retrying empty results while a server is younger than 45 s — so go-to-definition into Mathlib and `workspaceSymbol` across dependencies work from the first query.
 - **Memory**: each project's server can use significant RAM (Mathlib: several GB). `lean-goal stop` and closing the session both free it.
 - **Final verification**: the language server reflects live editor state; `lake build` remains the ground truth for CI-grade acceptance.
 - **Development**: `node test/run-tests.mjs` runs the full suite (framing, root detection, proxy routing, and live `lean-goal` tests when a toolchain is installed).
