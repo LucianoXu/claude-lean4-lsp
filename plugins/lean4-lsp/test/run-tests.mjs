@@ -16,8 +16,10 @@ function test(name, fn) { tests.push({ name, fn }); }
 
 // ---------------------------------------------------------------- lib tests
 
-const { findLakeRoot, resolveToolchain, LspFramer, frameMessage } =
-  await import('../bin/lean-lsp-lib.mjs');
+const {
+  findLakeRoot, resolveToolchain, LspFramer, frameMessage,
+  scanSorries, spliceSorry, rankNames, condenseSignature, moduleNameFor, truncate,
+} = await import('../bin/lean-lsp-lib.mjs');
 
 test('findLakeRoot: file inside a Lake project resolves to project root', () => {
   const file = path.join(FIXTURES, 'lakeproj/Lakeproj/A.lean');
@@ -88,6 +90,96 @@ test('LspFramer: handles messages split across chunks and back-to-back', () => {
   framer.push(joined.subarray(a.length + 5));
   assert.deepEqual(got.map((m) => m.id), [1, 2]);
   assert.equal(got[1].params.text, '∀ α, α → α');
+});
+
+// ------------------------------------------------- source scanning / splicing
+
+const SORRY_SRC = [
+  '-- sorry in a line comment',
+  '/- block sorry',
+  '   /- nested sorry -/ still inside sorry -/',
+  'def s := "a sorry string"',
+  'theorem t : True := by sorry',
+  '  sorry',
+  'def sorryish := 1',
+  '#check sorryAx',
+].join('\n');
+
+test('scanSorries: finds real sorries only', () => {
+  assert.deepEqual(scanSorries(SORRY_SRC), [{ line: 5, col: 24 }, { line: 6, col: 3 }]);
+});
+
+test('scanSorries: skips comments, nested blocks, strings and lookalike identifiers', () => {
+  // Every skipped case above would be a false positive for /\bsorry\b/.
+  assert.equal(scanSorries('-- sorry').length, 0);
+  assert.equal(scanSorries('/- a /- b sorry -/ c -/').length, 0);
+  assert.equal(scanSorries('"sorry"').length, 0);
+  assert.equal(scanSorries('sorryAx sorry_foo mysorry').length, 0);
+  // A backslash-escaped quote does not end the string literal…
+  assert.equal(scanSorries(String.raw`"a\" sorry"`).length, 0);
+  // …but once the literal really closes, the next token counts again.
+  assert.equal(scanSorries(String.raw`"a\"" sorry`).length, 1);
+});
+
+test('spliceSorry: indents continuation lines to the sorry column', () => {
+  const out = spliceSorry('example : True := by\n  sorry\n', 2, 3, 'constructor\ndone');
+  assert.equal(out, 'example : True := by\n  constructor\n  done\n');
+});
+
+test('spliceSorry: refuses a position that is not a sorry', () => {
+  assert.equal(spliceSorry('example : True := by\n  sorry\n', 1, 1, 'x'), null);
+  assert.equal(spliceSorry('example : True := by\n  sorry\n', 9, 1, 'x'), null);
+});
+
+test('rankNames: literal matches beat subsequence noise', () => {
+  const labels = [
+    'CategoryTheory.opShiftFunctorEquivalence_unitIso_hom_naturality', // subsequence only
+    'Matrix.trace_smul',
+    'LinearMap.trace_smulRight',
+  ];
+  const { ranked, dropped } = rankNames(labels, 'trace_smul');
+  assert.deepEqual(ranked, ['Matrix.trace_smul', 'LinearMap.trace_smulRight']);
+  assert.equal(dropped, 1);
+});
+
+test('rankNames: keeps subsequence matches when nothing better exists', () => {
+  const { ranked, dropped } = rankNames(['Foo.bar_baz'], 'zzz');
+  assert.deepEqual(ranked, ['Foo.bar_baz']);
+  assert.equal(dropped, 0);
+});
+
+test('condenseSignature: drops instance binders, keeps the statement', () => {
+  const sig = '∀ {n : Type u} [inst : Fintype n] [inst_1 : AddCommMonoid R] [DistribSMul α R]'
+    + ' (r : α) (A : Matrix n n R), (r • A).trace = r • A.trace';
+  assert.equal(condenseSignature(sig),
+    '∀ {n : Type u} (r : α) (A : Matrix n n R), (r • A).trace = r • A.trace');
+});
+
+test('condenseSignature: a stripped binder takes its arrow with it', () => {
+  // Otherwise the signature renders as a row of bare arrows: "→ → → Matrix n n R → Prop".
+  assert.equal(condenseSignature('{n : Type u} → [inst : Fintype n] → [CommRing R] → Matrix n n R → Prop'),
+    '{n : Type u} → Matrix n n R → Prop');
+  assert.equal(condenseSignature('[inst : Fintype n] → Matrix n n R → Prop'), 'Matrix n n R → Prop');
+});
+
+test('condenseSignature: leaves list literals alone', () => {
+  assert.equal(condenseSignature('(l : List Nat) , l = [a, b]'), '(l : List Nat) , l = [a, b]');
+});
+
+test('truncate: marks how much was dropped', () => {
+  assert.equal(truncate('abcdefghij', 4), 'abcd … [+6 chars]');
+  assert.equal(truncate('abc', 10), 'abc');
+});
+
+test('moduleNameFor: derives the Lake target from a source path', () => {
+  assert.equal(moduleNameFor('/p', '/p/Foo/Bar.lean'), 'Foo.Bar');
+  assert.equal(moduleNameFor('/p', '/p/Foo.lean'), 'Foo');
+});
+
+test('moduleNameFor: refuses paths no target of this package covers', () => {
+  assert.equal(moduleNameFor('/p', '/other/Foo.lean'), null);
+  assert.equal(moduleNameFor('/p', '/p/.lake/packages/dep/D.lean'), null);
+  assert.equal(moduleNameFor('/p', '/p/Foo/Bar.txt'), null);
 });
 
 // ---------------------------------------------------------------- proxy tests
@@ -325,6 +417,59 @@ leanTest('lean-goal: daemon persists between calls and stops on request', () => 
   assert.equal(r.status, 0, `stop works, stderr: ${r.stderr}`);
   const after = fs.readdirSync(GOAL_DIR).filter((f) => f.endsWith('.sock'));
   assert.equal(after.length, 0, 'sockets removed after stop');
+});
+
+leanTest('lean-goal try: a working tactic reports success and leaves the file untouched', () => {
+  const before = fs.readFileSync(C_LEAN, 'utf8');
+  const r = leanGoal(['try', `${C_LEAN}:1`, 'rfl']);
+  assert.equal(r.status, 0, `exit 0, stdout: ${r.stdout} stderr: ${r.stderr}`);
+  assert.match(r.stdout, /✓/);
+  assert.equal(fs.readFileSync(C_LEAN, 'utf8'), before, 'candidate must not be written to disk');
+});
+
+leanTest('lean-goal try: a failing tactic exits 1 and shows the error it would cause', () => {
+  const r = leanGoal(['try', `${C_LEAN}:1`, 'exact 5']);
+  assert.equal(r.status, 1, `exit 1, stdout: ${r.stdout}`);
+  assert.match(r.stdout, /error/i);
+});
+
+leanTest('lean-goal try: a candidate that is itself a sorry does not count as proved', () => {
+  const r = leanGoal(['try', `${C_LEAN}:1`, 'sorry']);
+  assert.equal(r.status, 1, `exit 1, stdout: ${r.stdout}`);
+  assert.match(r.stdout, /still discharged by a `sorry`/);
+});
+
+leanTest('lean-goal try: refuses a position with no sorry, pointing at the fix', () => {
+  const r = leanGoal(['try', `${BAD_LEAN}:1`, 'rfl']);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /no `sorry` on line 1/);
+});
+
+leanTest('lean-goal cmd: runs a command in the file\'s import context', () => {
+  const r = leanGoal(['cmd', C_LEAN, '#check Nat.succ']);
+  assert.equal(r.status, 0, `exit 0, stdout: ${r.stdout} stderr: ${r.stderr}`);
+  assert.match(r.stdout, /Nat\.succ/);
+});
+
+leanTest('lean-goal cmd: a failing command exits 1', () => {
+  const r = leanGoal(['cmd', C_LEAN, '#check no_such_name_at_all']);
+  assert.equal(r.status, 1, `exit 1, stdout: ${r.stdout}`);
+});
+
+leanTest('lean-goal search: finds environment names and shows signatures', () => {
+  const r = leanGoal(['search', C_LEAN, 'Nat.succ_le']);
+  assert.equal(r.status, 0, `exit 0, stderr: ${r.stderr}`);
+  assert.match(r.stdout, /Nat\.succ_le/);
+});
+
+leanTest('lean-goal sorries: a broken statement is flagged before its goals', () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'lean-goal-broken-')), 'Broken.lean');
+  // The statement does not elaborate, so the goal below it is meaningless.
+  // (An unbound name would be auto-bound as an implicit and elaborate fine —
+  // this needs a genuine type error.)
+  fs.writeFileSync(f, 'example : (1 : Nat) + True := by sorry\n');
+  const r = leanGoal(['sorries', f]);
+  assert.match(r.stdout, /error\(s\) were already present/);
 });
 
 // ------------------------------------------------------------- runner
