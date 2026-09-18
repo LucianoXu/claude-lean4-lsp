@@ -45,15 +45,21 @@ Or for a single session from a checkout: `claude --plugin-dir ./claude-lean4-lsp
 lean-goal sorries Closure.lean               # every sorry, with its goal
 lean-goal goal Closure.lean:42:7             # tactic goals at a position
 lean-goal try Closure.lean:42 'ring'         # does this tactic work? (file untouched)
+lean-goal try --apply Closure.lean:42 'ring' # …and keep it if it does
+lean-goal check --errors-only --compact X.lean  # one line per error
 lean-goal hint Closure.lean:42               # exact? / simp? / rw? suggestions
 lean-goal search Closure.lean trace_smul     # find lemmas by name fragment
 lean-goal cmd Closure.lean '#check @Foo.bar' # exact statement of a name
 lean-goal check Closure.lean                 # diagnostics, in seconds
-lean-goal build Closure.lean                 # lake build, and sorries fail it
+lean-goal build Closure.lean --axioms Foo.bar  # lake build, sorries fail it, then #print axioms
 lean-goal status / stop                      # warm servers, free their memory
 ```
 
 Positions are 1-based. Without a column, the position defaults to the first `sorry` on the line — comments and string literals are skipped, so `-- TODO: sorry` is not mistaken for an open goal. The first query on a project starts a background server (up to ~1 min with Mathlib imports); subsequent queries are near-instant. Daemons idle out after 30 minutes, and are replaced automatically when the plugin is upgraded underneath them.
+
+`try` on a line that already holds a tactic replaces that tactic instead of a `sorry` — repair, not just filling in. In either form, a candidate that works is written to disk only with `--apply`.
+
+**Imports are watched.** Lean's server re-reads a document's imports only when the document is opened, so after an edit to an imported module every open importer keeps elaborating against the old oleans — the VS Code extension has a manual "Restart File" for this. `lean-goal` fingerprints the project-local import closure of each file it holds open and reopens the file when that changes, so an edit to `Foo/Basic.lean` is seen by the next `check` of `Foo/Main.lean` (and says so: `imports of this file changed since it was opened — reloaded them`). Build-progress lines that Lake echoes as diagnostics (`✔ [12/40] Built …`) are filtered out of both `check` and the live diagnostics Claude Code sees; set `LEAN4_LSP_KEEP_BUILD_INFO=1` to keep them.
 
 `lean-goal build` is deliberately stricter than `lake build`: a file whose declarations still use `sorry` compiles fine and exits 0, which for a proof is the one result that must not read as success. Pass `--allow-sorry` for work in progress.
 
@@ -73,6 +79,7 @@ A bundled skill (`lean-interactive-proving`) teaches Claude the workflow: get th
 | `LEAN4_LSP_MAX_MSG` | Truncate each diagnostic to N characters (default 4000) |
 | `LEAN4_LSP_MAX_COMPLETIONS` / `LEAN4_LSP_MAX_HINT_LINES` | Result caps for `search` / `hint` (default 40 / 24) |
 | `LEAN4_LSP_SILENCE_MS` | Fallback elaboration-quiet window for servers that never report progress (default 5 s) |
+| `LEAN4_LSP_KEEP_BUILD_INFO=1` | Keep Lake's build-progress info diagnostics instead of filtering them |
 
 ## Notes
 

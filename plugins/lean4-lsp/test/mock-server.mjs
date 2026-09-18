@@ -29,8 +29,13 @@ framer.onMessage = (msg) => {
   } else if (msg.method === 'textDocument/didOpen') {
     send({ jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: {
       uri: msg.params.textDocument.uri,
-      diagnostics: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
-        severity: 3, message: `mock-${tag} opened from ${process.cwd()}` }],
+      diagnostics: [
+        { range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+          severity: 3, message: `mock-${tag} opened from ${process.cwd()}` },
+        // What `lake setup-file` echoes into the diagnostics of a real server.
+        { range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
+          severity: 3, message: '✔ [3/4] Built Dep.D (12ms)' },
+      ],
     } });
   } else if (msg.method === 'textDocument/documentSymbol') {
     if (emptyFirst > 0) { emptyFirst--; send({ jsonrpc: '2.0', id: msg.id, result: [] }); return; }

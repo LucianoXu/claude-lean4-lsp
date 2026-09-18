@@ -34,8 +34,11 @@ full re-elaboration, and leaves broken text behind when the guess is wrong.
 3. **Verify before writing:** `lean-goal try <file>:<line> '<tactic>'`
    → `✓` means it closes the goal; `✗` prints the errors it would cause.
    Try several candidates in a row — each is about a second, and none of them
-   touch the file.
-4. Only now edit the file, with a tactic you have already seen succeed.
+   touch the file. On a line that already holds a failing tactic, `try`
+   replaces that tactic, so a broken step can be repaired without first
+   turning it back into a `sorry`.
+4. Only now edit the file, with a tactic you have already seen succeed —
+   `lean-goal try --apply …` writes it for you.
 5. `lean-goal check <file>` after the edit, then `lean-goal build <file>` as the
    gate. Positions are 1-based throughout.
 
@@ -79,4 +82,12 @@ place, and to reach anything under `.lake/packages`.
   different — it resolves relative paths against the shell's working directory,
   so pass it absolute paths.
 - Diagnostics reflect the live in-memory file, which is what makes them fast.
-  `lean-goal build` is the ground truth.
+  `lean-goal build` is the ground truth. `lean-goal check --errors-only
+  --compact` gives one line per error when a file has many.
+- After editing a module that other open files import, just query the
+  importer again: `lean-goal` notices the import changed and reopens the file
+  (it prints `reloaded them before answering`). If a constant you just defined
+  is reported unknown anyway, the import was not rebuilt — `lean-goal build`
+  the importer once.
+- `lean-goal build <file> --axioms <decl>` prints `#print axioms` for a
+  declaration right after the build, against the oleans it produced.

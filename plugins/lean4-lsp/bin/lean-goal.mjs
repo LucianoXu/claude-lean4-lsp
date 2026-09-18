@@ -34,7 +34,8 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
   findLakeRoot, resolveToolchain, LspFramer, frameMessage, pathToUri, moduleNameFor,
-  scanSorries, spliceSorry, truncate, rankNames, condenseSignature,
+  scanSorries, spliceSorry, spliceLine, truncate, rankNames, condenseSignature,
+  importClosureStamp, stripTrace, isBuildNoise,
 } from './lean-lsp-lib.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -95,7 +96,9 @@ class LeanSession {
     this.spec = spec;
     this.nextId = 1;
     this.pending = new Map();          // id -> {resolve, reject}
-    this.docs = new Map();             // uri -> {version, text}
+    this.docs = new Map();             // uri -> {version, text, stamp}
+    this.versions = new Map();         // uri -> last version sent (monotone across reopens)
+    this.reloaded = new Set();         // uris reopened since the client last asked
     this.diags = new Map();            // uri -> diagnostic[]
     this.progress = new Map();         // uri -> 'processing' | 'done'
     this.sawAnyProgress = false;       // has this server ever reported progress?
@@ -129,7 +132,7 @@ class LeanSession {
           publishDiagnostics: { versionSupport: true },
         },
       },
-      clientInfo: { name: 'lean-goal', version: '0.3.0' },
+      clientInfo: { name: 'lean-goal', version: '0.4.0' },
     }).then(() => this.notify('initialized', {}));
   }
 
@@ -191,19 +194,41 @@ class LeanSession {
     this.progressWaiters = this.progressWaiters.filter((w) => !w());
   }
 
-  /** Push `text` as the current content of `file`, opening it if needed. */
+  /**
+   * Push `text` as the current content of `file`, opening it if needed.
+   *
+   * If a project-local import of the file changed since the document was
+   * opened, close and reopen it first: the server re-elaborates the header
+   * only on open, so without this every query after an edit to an imported
+   * module runs against the old oleans and reports constants that exist as
+   * unknown (or the reverse). Versions stay monotone across the reopen so a
+   * late publish for the old incarnation is still recognised as stale.
+   */
   setText(file, text) {
     const uri = pathToUri(file);
-    const doc = this.docs.get(uri);
+    let doc = this.docs.get(uri);
+    const stamp = importClosureStamp(this.spec.root, file);
+    if (doc && doc.stamp !== stamp) {
+      if (this.log) this.log(`imports of ${file} changed (${doc.stamp} -> ${stamp}); reopening`);
+      this.notify('textDocument/didClose', { textDocument: { uri } });
+      this.docs.delete(uri);
+      this.diags.delete(uri);
+      this.sawDiags.delete(uri);
+      this.reloaded.add(uri);
+      doc = undefined;
+    }
     if (!doc) {
-      this.docs.set(uri, { version: 1, text });
+      const version = (this.versions.get(uri) || 0) + 1;
+      this.versions.set(uri, version);
+      this.docs.set(uri, { version, text, stamp });
       this.progress.set(uri, 'processing');
       this.settled.delete(uri);
       this.notify('textDocument/didOpen', {
-        textDocument: { uri, languageId: 'lean', version: 1, text },
+        textDocument: { uri, languageId: 'lean', version, text },
       });
     } else if (doc.text !== text) {
       doc.version++;
+      this.versions.set(uri, doc.version);
       doc.text = text;
       this.progress.set(uri, 'processing');
       this.settled.delete(uri);
@@ -213,6 +238,14 @@ class LeanSession {
       });
     }
     return uri;
+  }
+
+  /** Whether `file` was reopened for changed imports since the last time asked. */
+  popReloaded(file) {
+    const uri = pathToUri(file);
+    const r = this.reloaded.has(uri);
+    this.reloaded.delete(uri);
+    return r;
   }
 
   /** Open the file (or resync it if the on-disk content changed). */
@@ -332,6 +365,7 @@ async function runDaemon(mode, root, sockPath) {
   const spec = serverSpecFor(mode === 'lake' ? path.join(root, 'lakefile.toml') : path.join(root, '_.lean'));
   spec.root = root; spec.mode = mode;
   const session = new LeanSession(spec);
+  session.log = dlog;
   dlog(`daemon starting: ${spec.bin} ${spec.args.join(' ')} in ${root}`);
 
   let idleTimer = null;
@@ -396,12 +430,12 @@ async function runDaemon(mode, root, sockPath) {
     switch (req.cmd) {
       case 'goal': {
         const r = await session.plainGoal(req.file, req.line, req.col, timeoutMs);
-        return { ok: true, ...r };
+        return { ok: true, ...r, reloaded: session.popReloaded(req.file) };
       }
 
       case 'check': {
         const diagnostics = await session.diagnosticsFor(req.file, timeoutMs);
-        return { ok: true, diagnostics };
+        return { ok: true, diagnostics, reloaded: session.popReloaded(req.file) };
       }
 
       case 'sorries': {
@@ -416,21 +450,30 @@ async function runDaemon(mode, root, sockPath) {
           ok: true,
           sorries: results,
           baselineErrors: (session.diags.get(uri) || []).filter((d) => d.severity === 1),
+          reloaded: session.popReloaded(req.file),
         };
       }
 
       case 'try': {
         const original = fs.readFileSync(req.file, 'utf8');
-        const spliced = spliceSorry(original, req.line, req.col, req.tactic);
-        if (spliced === null) {
-          return {
-            ok: false,
-            error: `no \`sorry\` at ${req.file}:${req.line}:${req.col} — \`try\` replaces a `
-              + 'sorry with the candidate tactic, so put one there first '
-              + '(`lean-goal sorries <file>` lists them).',
-          };
+        let spliced, replaced = null;
+        if (req.mode === 'line') {
+          const r = spliceLine(original, req.line, req.tactic);
+          if (r === null) return { ok: false, error: `line ${req.line} of ${req.file} is blank or out of range` };
+          spliced = r.text; replaced = r.replaced;
+        } else {
+          spliced = spliceSorry(original, req.line, req.col, req.tactic);
+          if (spliced === null) {
+            return {
+              ok: false,
+              error: `no \`sorry\` at ${req.file}:${req.line}:${req.col} — \`try\` replaces a `
+                + 'sorry with the candidate tactic, so put one there first '
+                + '(`lean-goal sorries <file>` lists them).',
+            };
+          }
         }
         const before = await session.diagnosticsFor(req.file, timeoutMs);
+        const reloaded = session.popReloaded(req.file);
         const baseline = new Map();
         for (const d of before) baseline.set(diagKey(d), (baseline.get(diagKey(d)) || 0) + 1);
         return session.withText(req.file, spliced, timeoutMs, (_uri, after) => {
@@ -445,13 +488,17 @@ async function runDaemon(mode, root, sockPath) {
             if (n > 0) remaining.set(k, n - 1); else introduced.push(d);
           }
           const sorryWarns = (ds) => ds.filter((d) => SORRY_WARN.test(d.message)).length;
+          const errs = (ds) => ds.filter((d) => d.severity === 1).length;
           return {
             ok: true,
             introduced: introduced.sort((a, b) => (a.severity || 9) - (b.severity || 9)),
             preexisting: after.length - introduced.length,
             sorriesBefore: sorryWarns(before),
             sorriesAfter: sorryWarns(after),
+            resolvedErrors: Math.max(0, errs(before) - errs(after)),
             baselineErrors: before.filter((d) => d.severity === 1),
+            replaced,
+            reloaded,
           };
         });
       }
@@ -460,6 +507,7 @@ async function runDaemon(mode, root, sockPath) {
         const original = fs.readFileSync(req.file, 'utf8');
         const baselineErrors = (await session.diagnosticsFor(req.file, timeoutMs))
           .filter((d) => d.severity === 1);
+        const reloaded = session.popReloaded(req.file);
         const out = [];
         for (const tac of req.tactics) {
           const spliced = spliceSorry(original, req.line, req.col, tac);
@@ -469,7 +517,7 @@ async function runDaemon(mode, root, sockPath) {
           const r = await session.withText(req.file, spliced, timeoutMs, (_uri, diags) => diags);
           out.push({ tactic: tac, diagnostics: r });
         }
-        return { ok: true, hints: out, baselineErrors };
+        return { ok: true, hints: out, baselineErrors, reloaded };
       }
 
       case 'cmd': {
@@ -482,6 +530,7 @@ async function runDaemon(mode, root, sockPath) {
           diagnostics: diags.filter((d) => d.range.start.line + 1 > firstAppendedLine),
           other: diags.filter((d) => d.range.start.line + 1 <= firstAppendedLine)
             .filter((d) => d.severity === 1).length,
+          reloaded: session.popReloaded(req.file),
         }));
       }
 
@@ -609,11 +658,19 @@ function parseLocation(arg, { requireSorry = false } = {}) {
 
 const SEV = { 1: 'error', 2: 'warning', 3: 'info', 4: 'hint' };
 
-function fmtDiag(file, d, { prefix = '  ' } = {}) {
+function fmtDiag(file, d, { prefix = '  ', compact = false } = {}) {
   const s = d.range.start, e = d.range.end;
   const sev = SEV[d.severity] || 'info';
+  const msg = stripTrace(d.message);
+  if (compact) return `${prefix}${sev} ${file}:${s.line + 1}:${s.character + 1}: ${msg.split('\n')[0]}`;
   return `${prefix}${sev} ${file}:${s.line + 1}:${s.character + 1}-${e.line + 1}:${e.character + 1}: `
-    + truncate(d.message, MAX_MSG);
+    + truncate(msg, MAX_MSG);
+}
+
+function noteReloaded(resp) {
+  if (resp.reloaded) {
+    console.log('(imports of this file changed since it was opened — reloaded them before answering)');
+  }
 }
 
 function renderGoal(goal) {
@@ -661,12 +718,15 @@ const USAGE = `lean-goal — Lean 4 proof state, candidate tactics, and environm
 inspect:
   lean-goal goal <file>:<line>[:<col>]     tactic goals at a position
   lean-goal sorries <file>                 the goal at every sorry
-  lean-goal check <file>...                elaborate and report diagnostics
+  lean-goal check [--errors-only] [--compact] <file>...
+                                           elaborate and report diagnostics
 
 experiment (in memory — the file on disk is never modified):
-  lean-goal try <file>:<line>[:<col>] '<tactic>'
+  lean-goal try [--apply] <file>:<line>[:<col>] '<tactic>'
                                            elaborate a candidate tactic in
-                                           place of that sorry
+                                           place of that sorry — or of the
+                                           tactic on that line; --apply keeps
+                                           a candidate that works
   lean-goal hint <file>:<line>[:<col>] [tactic...]
                                            run exact? / simp? / rw? there and
                                            show what the library offers
@@ -678,12 +738,15 @@ explore:
 
 verify / manage:
   lean-goal build [file|dir]               lake build that module; a \`sorry\`
-                                           fails the gate (--allow-sorry opts out)
+                                           fails the gate (--allow-sorry opts out);
+                                           --axioms <decl> prints its axioms after
   lean-goal status                         list running daemons
   lean-goal stop                           stop them and free their memory
 
 Positions are 1-based. Without <col>, the position is the first \`sorry\` on
-the line (for goal, the end of the line if there is none).`;
+the line (for goal, the end of the line if there is none). A file whose
+imports changed since it was opened is reopened before answering, so an
+edit to an imported module is always seen.`;
 
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
@@ -695,6 +758,7 @@ async function main() {
       const resp = await queryDaemon(spec, { cmd: 'goal', file, line, col });
       if (!resp.ok) fail(resp.error);
       console.log(`${file}:${line}:${col} (${spec.mode} mode, root ${spec.root})`);
+      noteReloaded(resp);
       const g = renderGoal(resp.goal);
       if (g) {
         console.log('Tactic goals:');
@@ -718,6 +782,7 @@ async function main() {
       if (!resp.ok) fail(resp.error);
       if (!resp.sorries.length) { console.log(`${file}: no sorries ✓`); return; }
       console.log(`${file}: ${resp.sorries.length} sorr${resp.sorries.length === 1 ? 'y' : 'ies'}\n`);
+      noteReloaded(resp);
       warnBaselineErrors(file, resp.baselineErrors);
       for (const s of resp.sorries) {
         console.log(`\n${file}:${s.line}:${s.col}`);
@@ -727,20 +792,29 @@ async function main() {
     }
 
     case 'check': {
-      if (!rest.length) fail('usage: lean-goal check <file>...');
+      const errorsOnly = rest.includes('--errors-only');
+      const compact = rest.includes('--compact');
+      const files = rest.filter((a) => !a.startsWith('--'));
+      if (!files.length) fail('usage: lean-goal check [--errors-only] [--compact] <file>...');
       let totalErrors = 0;
-      for (const arg of rest) {
+      for (const arg of files) {
         const file = path.resolve(arg);
         if (!fs.existsSync(file)) fail(`no such file: ${file}`);
         const spec = serverSpecFor(file);
         const resp = await queryDaemon(spec, { cmd: 'check', file });
         if (!resp.ok) fail(resp.error);
-        const diags = resp.diagnostics;
+        const diags = resp.diagnostics.filter((d) => !isBuildNoise(d));
         const errors = diags.filter((d) => d.severity === 1);
+        const warnings = diags.filter((d) => d.severity === 2);
         totalErrors += errors.length;
-        console.log(`${file}: ${errors.length} error(s), ${diags.filter((d) => d.severity === 2).length} warning(s)`);
-        for (const d of diags) console.log(fmtDiag(file, d));
+        console.log(`${file}: ${errors.length} error(s), ${warnings.length} warning(s)`);
+        noteReloaded(resp);
+        const shown = errorsOnly ? errors : diags;
+        for (const d of shown) console.log(fmtDiag(file, d, { compact }));
         if (!diags.length) console.log('  clean ✓');
+        else if (errorsOnly && diags.length > errors.length) {
+          console.log(`  (${diags.length - errors.length} non-error diagnostic(s) hidden by --errors-only)`);
+        }
       }
       console.log(FOOTER);
       process.exit(totalErrors ? 1 : 0);
@@ -748,32 +822,58 @@ async function main() {
     }
 
     case 'try': {
-      if (!rest[0] || rest[1] === undefined) {
-        fail("usage: lean-goal try <file>:<line>[:<col>] '<tactic>'");
+      const apply = rest.includes('--apply');
+      const args = rest.filter((a) => a !== '--apply');
+      if (!args[0] || args[1] === undefined) {
+        fail("usage: lean-goal try [--apply] <file>:<line>[:<col>] '<tactic>'");
       }
-      const { file, line, col } = parseLocation(rest[0], { requireSorry: true });
-      const tactic = rest.slice(1).join(' ');
+      // With a `sorry` at the position the candidate replaces the sorry; on a
+      // line that already holds a tactic, it replaces that tactic. The second
+      // form is repair: a proof exists, one step of it is wrong, and the
+      // question is whether another step works in its place.
+      const { file, line, col } = parseLocation(args[0]);
+      const text = fs.readFileSync(file, 'utf8');
+      const mode = scanSorries(text).some((s) => s.line === line && s.col === col) ? 'sorry' : 'line';
+      const tactic = args.slice(1).join(' ');
       const spec = serverSpecFor(file);
-      const resp = await queryDaemon(spec, { cmd: 'try', file, line, col, tactic });
+      const resp = await queryDaemon(spec, { cmd: 'try', file, line, col, tactic, mode });
       if (!resp.ok) fail(resp.error);
       const errors = resp.introduced.filter((d) => d.severity === 1);
-      const stillSorry = resp.sorriesAfter >= resp.sorriesBefore;
-      console.log(`${file}:${line}:${col}  sorry ⟶  ${tactic.split('\n').join(' ⏎ ')}\n`);
-      warnBaselineErrors(file, resp.baselineErrors);
+      const stillSorry = mode === 'sorry'
+        ? resp.sorriesAfter >= resp.sorriesBefore
+        : resp.sorriesAfter > resp.sorriesBefore;
+      const shown = tactic.split('\n').join(' ⏎ ');
+      console.log(mode === 'sorry'
+        ? `${file}:${line}:${col}  sorry ⟶  ${shown}\n`
+        : `${file}:${line}  ${resp.replaced} ⟶  ${shown}\n`);
+      noteReloaded(resp);
+      // In line mode the old tactic's own errors are what the candidate is
+      // meant to fix, so they are not "already present" in the warning's sense.
+      warnBaselineErrors(file, resp.baselineErrors.filter((d) => mode === 'sorry' || d.range.start.line + 1 !== line));
+      const ok = !errors.length && !stillSorry;
       if (errors.length) {
         console.log(`\n✗ ${errors.length} new error(s):`);
       } else if (stillSorry) {
         console.log('\n⚠ no new errors, but the goal is still discharged by a `sorry`'
           + ' — this candidate does not prove anything.');
-      } else {
+      } else if (mode === 'sorry') {
         console.log('\n✓ elaborates with no new errors — this tactic closes the goal.');
-        console.log('  The file on disk is unchanged; apply the edit to keep it.');
+      } else {
+        console.log(`\n✓ elaborates with no new errors${resp.resolvedErrors
+          ? ` and resolves ${resp.resolvedErrors} error(s) the old line caused` : ''}.`);
       }
       for (const d of resp.introduced) console.log(fmtDiag(file, d));
       if (resp.preexisting) {
         console.log(`\n(${resp.preexisting} pre-existing diagnostic(s) elsewhere in the file, unchanged)`);
       }
-      process.exit(errors.length || stillSorry ? 1 : 0);
+      if (ok && apply) {
+        const out = mode === 'sorry' ? spliceSorry(text, line, col, tactic) : spliceLine(text, line, tactic).text;
+        fs.writeFileSync(file, out);
+        console.log(`  applied to ${file}.`);
+      } else if (ok) {
+        console.log('  The file on disk is unchanged; pass --apply, or edit it, to keep the tactic.');
+      }
+      process.exit(ok ? 0 : 1);
       return;
     }
 
@@ -790,6 +890,7 @@ async function main() {
       const resp = await queryDaemon(spec, { cmd: 'hint', file, line, col, tactics });
       if (!resp.ok) fail(resp.error);
       console.log(`${file}:${line}:${col}\n`);
+      noteReloaded(resp);
       warnBaselineErrors(file, resp.baselineErrors);
       let any = false;
       for (const h of resp.hints) {
@@ -845,9 +946,10 @@ async function main() {
       const resp = await queryDaemon(spec, { cmd: 'cmd', file, command });
       if (!resp.ok) fail(resp.error);
       console.log(`${command}   (elaborated at the end of ${path.basename(file)})`);
+      noteReloaded(resp);
       if (!resp.diagnostics.length) console.log('  (no output)');
       for (const d of resp.diagnostics) {
-        console.log(`  ${SEV[d.severity] || 'info'}: ${truncate(d.message, MAX_MSG)}`);
+        console.log(`  ${SEV[d.severity] || 'info'}: ${truncate(stripTrace(d.message), MAX_MSG)}`);
       }
       if (resp.other) {
         console.log(`\n(note: ${resp.other} pre-existing error(s) in the file itself — `
@@ -868,7 +970,12 @@ async function main() {
       // default target would happily report success for a file it never
       // compiled — scratch modules outside the root import are the common case.
       const mod = isDir ? null : moduleNameFor(root, target);
-      const passthrough = rest.slice(1).filter((a) => a !== '--allow-sorry');
+      const axIdx = rest.indexOf('--axioms');
+      const axioms = axIdx !== -1 ? rest[axIdx + 1] : null;
+      if (axIdx !== -1 && !axioms) fail('usage: lean-goal build <file> --axioms <declaration>');
+      if (axioms && !mod) fail('--axioms needs a file argument inside the project, to know what to import');
+      const passthrough = rest.slice(1).filter((a, i) => a !== '--allow-sorry'
+        && a !== '--axioms' && !(axIdx !== -1 && i + 1 === axIdx + 1));
       const allowSorry = rest.includes('--allow-sorry');
       const args = ['build', ...(mod ? [mod] : []), ...passthrough];
       console.log(`lake ${args.join(' ')}   (in ${root})`);
@@ -894,6 +1001,22 @@ async function main() {
           + ' the proof is incomplete. Pass --allow-sorry to accept work in progress.');
       } else if (sorries) console.log(`\n✓ build succeeded (${sorries} sorry warning(s) allowed)`);
       else console.log('\n✓ build succeeded — no errors, no sorries');
+      // `#print axioms` fires only when its module elaborates, so it belongs
+      // right after a successful build, against the oleans that build wrote.
+      if (axioms && code === 0) {
+        const probe = path.join(os.tmpdir(), `lean-goal-axioms-${process.pid}.lean`);
+        fs.writeFileSync(probe, `import ${mod}\n#print axioms ${axioms}\n`);
+        const r = spawn(tc.lake, ['env', tc.lean || 'lean', probe], {
+          cwd: root, env: tc.env, stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let aout = '';
+        r.stdout.on('data', (c) => { aout += c; });
+        r.stderr.on('data', (c) => { aout += c; });
+        await new Promise((res) => r.on('exit', res));
+        try { fs.unlinkSync(probe); } catch {}
+        console.log(`\n#print axioms ${axioms}:`);
+        for (const l of aout.split('\n')) if (l.trim()) console.log(`  ${l.replace(/^[^:]*:\d+:\d+: /, '')}`);
+      }
       process.exit(code === 0 && (!sorries || allowSorry) ? 0 : 1);
       return;
     }

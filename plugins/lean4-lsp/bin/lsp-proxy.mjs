@@ -22,7 +22,7 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { appendFileSync as fsAppend } from 'node:fs';
 import {
-  findLakeRoot, resolveToolchain, LspFramer, frameMessage, uriToPath, pathToUri,
+  findLakeRoot, resolveToolchain, LspFramer, frameMessage, uriToPath, pathToUri, isBuildNoise,
 } from './lean-lsp-lib.mjs';
 
 const DEBUG = !!process.env.LEAN4_LSP_DEBUG;
@@ -290,7 +290,18 @@ function onServerMessage(srv, msg) {
     return;
   }
 
-  // Notification (diagnostics, progress, …): pass through.
+  // Notification (diagnostics, progress, …): pass through. Build-progress
+  // lines that `lake setup-file` surfaces as info diagnostics (`✔ [12/40]
+  // Built Foo`) are dropped: a Mathlib-sized import closure produces dozens
+  // per open, and the client relays every one of them into the conversation.
+  if (msg.method === 'textDocument/publishDiagnostics' && msg.params
+      && Array.isArray(msg.params.diagnostics) && !process.env.LEAN4_LSP_KEEP_BUILD_INFO) {
+    const kept = msg.params.diagnostics.filter((d) => !isBuildNoise(d));
+    if (kept.length !== msg.params.diagnostics.length) {
+      client.send({ ...msg, params: { ...msg.params, diagnostics: kept } });
+      return;
+    }
+  }
   client.send(msg);
 }
 

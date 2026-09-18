@@ -304,6 +304,104 @@ export function truncate(msg, max) {
   return `${msg.slice(0, max)} … [+${msg.length - max} chars]`;
 }
 
+// ---------------------------------------------------------------------------
+// Import tracking
+
+// Parsed import lists, keyed by path and mtime, so that walking a closure of a
+// few hundred modules on every query costs stats rather than reads.
+const importCache = new Map();
+
+/**
+ * Project-local modules a file imports, as source paths: `import A.B.C` is
+ * `<root>/A/B/C.lean` when that file exists. Dependency modules (Mathlib and
+ * the like, under `.lake/packages`) are not returned — their sources do not
+ * change under an editing session.
+ */
+export function projectImports(root, file) {
+  let mtime;
+  try { mtime = fs.statSync(file).mtimeMs; } catch { return []; }
+  const key = `${file}`;
+  const hit = importCache.get(key);
+  if (hit && hit.mtime === mtime) return hit.imports;
+  let text;
+  try { text = fs.readFileSync(file, 'utf8'); } catch { return []; }
+  const out = [];
+  const re = /^import\s+([\w.']+)/gm;
+  let m;
+  while ((m = re.exec(text))) {
+    const p = path.join(root, ...m[1].split('.')) + '.lean';
+    if (p !== path.resolve(file) && fs.existsSync(p)) out.push(p);
+  }
+  importCache.set(key, { mtime, imports: out });
+  return out;
+}
+
+/**
+ * Fingerprint of everything a file's header depends on inside the project:
+ * the transitive closure of its project-local imports, with the newest mtime
+ * among them. When it changes, an import was edited, and a document the
+ * server already holds open is elaborating against an environment that no
+ * longer exists on disk.
+ *
+ * Lean's server re-reads a document's imports only when the document is
+ * opened (or its header edited); editing an *imported* file leaves every
+ * open importer on the old oleans until it is closed and reopened. This is
+ * the same "Restart File" the VS Code extension asks for by hand, and it is
+ * what made `lean-goal check` report an unknown constant that had been
+ * defined and built ten seconds earlier.
+ */
+export function importClosureStamp(root, file) {
+  const seen = new Set();
+  const stack = [...projectImports(root, file)];   // a copy: the cached list must not be popped
+  let newest = 0;
+  while (stack.length) {
+    const p = stack.pop();
+    if (seen.has(p)) continue;
+    seen.add(p);
+    try { newest = Math.max(newest, fs.statSync(p).mtimeMs); } catch {}
+    for (const q of projectImports(root, p)) if (!seen.has(q)) stack.push(q);
+  }
+  return `${seen.size}:${Math.floor(newest)}`;
+}
+
+/**
+ * Replace the tactic on 1-based `line` — everything from its first non-blank
+ * character to the end of the line — with `replacement`, continuation lines
+ * indented to that column. Returns null for a blank or out-of-range line.
+ * This is `try` on a line that already holds a (failing) tactic, which is
+ * the common case once a proof exists and needs repair.
+ */
+export function spliceLine(text, line, replacement) {
+  const lines = text.split('\n');
+  if (line < 1 || line > lines.length) return null;
+  const cur = lines[line - 1];
+  const indent = cur.length - cur.trimStart().length;
+  if (!cur.trim()) return null;
+  const pad = ' '.repeat(indent);
+  const body = replacement.split('\n').map((l, k) => (k === 0 ? pad + l : pad + l)).join('\n');
+  lines[line - 1] = body;
+  return { text: lines.join('\n'), replaced: cur.trim(), col: indent + 1 };
+}
+
+/**
+ * Drop the `trace: .> LEAN_PATH=…` lines Lake echoes into a failed
+ * `setup-file` diagnostic: several hundred characters of search path per
+ * line, none of it about what went wrong.
+ */
+export function stripTrace(msg) {
+  return msg.split('\n').filter((l) => !/^\s*trace:\s/.test(l)).join('\n');
+}
+
+/**
+ * Build-progress lines (`✔ [12/40] Built Foo`) that Lake's `setup-file` step
+ * surfaces as info diagnostics at 1:1. They describe the build, not the file,
+ * and a Mathlib-sized import closure produces dozens per open.
+ */
+export const BUILD_NOISE = /^[✔✖⚠ℹ]\s*\[\d+\/\d+\]/;
+export function isBuildNoise(d) {
+  return (d.severity === 3 || d.severity === 4) && BUILD_NOISE.test(d.message);
+}
+
 /** file:// URI ↔ path helpers (Lean servers use standard file URIs). */
 export function uriToPath(uri) {
   if (!uri || !uri.startsWith('file://')) return null;

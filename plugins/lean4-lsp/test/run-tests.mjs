@@ -19,6 +19,7 @@ function test(name, fn) { tests.push({ name, fn }); }
 const {
   findLakeRoot, resolveToolchain, LspFramer, frameMessage,
   scanSorries, spliceSorry, rankNames, condenseSignature, moduleNameFor, truncate,
+  projectImports, importClosureStamp, spliceLine, stripTrace, isBuildNoise,
 } = await import('../bin/lean-lsp-lib.mjs');
 
 test('findLakeRoot: file inside a Lake project resolves to project root', () => {
@@ -129,6 +130,59 @@ test('spliceSorry: indents continuation lines to the sorry column', () => {
 test('spliceSorry: refuses a position that is not a sorry', () => {
   assert.equal(spliceSorry('example : True := by\n  sorry\n', 1, 1, 'x'), null);
   assert.equal(spliceSorry('example : True := by\n  sorry\n', 9, 1, 'x'), null);
+});
+
+test('spliceLine: replaces the tactic on a line, keeping its indentation', () => {
+  const r = spliceLine('example : True := by\n  exact 5\n', 2, 'trivial');
+  assert.deepEqual(r, { text: 'example : True := by\n  trivial\n', replaced: 'exact 5', col: 3 });
+  const multi = spliceLine('by\n    foo\n', 2, 'constructor\nrfl');
+  assert.equal(multi.text, 'by\n    constructor\n    rfl\n');
+});
+
+test('spliceLine: refuses blank and out-of-range lines', () => {
+  assert.equal(spliceLine('a\n\nb\n', 2, 'x'), null);
+  assert.equal(spliceLine('a\n', 5, 'x'), null);
+});
+
+test('stripTrace: drops the LEAN_PATH trace lines, keeps the message', () => {
+  const msg = 'setup-file failed:\ntrace: .> LEAN_PATH=/a:/b lean X.lean\nerror: X.lean:3:1: boom';
+  assert.equal(stripTrace(msg), 'setup-file failed:\nerror: X.lean:3:1: boom');
+});
+
+test('isBuildNoise: build-progress infos only', () => {
+  const at = (severity, message) => ({ severity, message, range: {} });
+  assert.ok(isBuildNoise(at(3, '✔ [12/40] Built Foo.Bar (1.2s)')));
+  assert.ok(isBuildNoise(at(3, 'ℹ [1/2] Built Foo')));
+  assert.ok(!isBuildNoise(at(1, '✖ [2/2] Building Foo')), 'an error stays');
+  assert.ok(!isBuildNoise(at(3, "'foo' depends on axioms: [propext]")), 'a real info stays');
+});
+
+test('projectImports / importClosureStamp: follow project-local imports transitively', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lean-lsp-imports-'));
+  fs.mkdirSync(path.join(root, 'P'));
+  fs.writeFileSync(path.join(root, 'P', 'A.lean'), 'def a := 1\n');
+  fs.writeFileSync(path.join(root, 'P', 'B.lean'), 'import P.A\nimport Mathlib.Data.Nat.Basic\ndef b := a\n');
+  fs.writeFileSync(path.join(root, 'P', 'C.lean'), 'import P.B\n');
+  assert.deepEqual(projectImports(root, path.join(root, 'P', 'C.lean')), [path.join(root, 'P', 'B.lean')]);
+  assert.deepEqual(projectImports(root, path.join(root, 'P', 'B.lean')), [path.join(root, 'P', 'A.lean')],
+    'dependency modules are not on disk under the root, so they are ignored');
+  const s1 = importClosureStamp(root, path.join(root, 'P', 'C.lean'));
+  assert.ok(s1.startsWith('2:'), `closure has two files: ${s1}`);
+  // Touch the transitive import into the future: the stamp must move.
+  const later = new Date(Date.now() + 5000);
+  fs.utimesSync(path.join(root, 'P', 'A.lean'), later, later);
+  const s2 = importClosureStamp(root, path.join(root, 'P', 'C.lean'));
+  assert.notEqual(s1, s2);
+  // Editing the file itself does not count: it is the header's imports that matter.
+  fs.writeFileSync(path.join(root, 'P', 'C.lean'), 'import P.B\n-- edited\n');
+  assert.equal(importClosureStamp(root, path.join(root, 'P', 'C.lean')), s2);
+  // The stamp is stable across repeated calls: an earlier version consumed
+  // the cached import list while walking it, and every second query saw an
+  // empty closure (`0:0`), so files were reopened once and never again.
+  assert.equal(importClosureStamp(root, path.join(root, 'P', 'C.lean')), s2);
+  assert.equal(importClosureStamp(root, path.join(root, 'P', 'B.lean')),
+    importClosureStamp(root, path.join(root, 'P', 'B.lean')));
+  fs.rmSync(root, { recursive: true, force: true });
 });
 
 test('rankNames: literal matches beat subsequence noise', () => {
@@ -272,9 +326,11 @@ test('proxy: routes documents from two projects to two servers', async () => {
     assert.equal(r1.result[0].name, `sym@${path.join(FIXTURES, 'lakeproj')}`);
     assert.equal(r2.result[0].name, `sym@${path.join(FIXTURES, 'standalone')}`);
     assert.equal(launches(c).length, 2, 'exactly two servers');
-    // diagnostics from both servers reach the client untouched
-    await c.waitFor((m) => m.method === 'textDocument/publishDiagnostics' && m.params.uri === pathToUri(lakeFile), 5000, 'lake diagnostics');
+    // diagnostics from both servers reach the client
+    const d1 = await c.waitFor((m) => m.method === 'textDocument/publishDiagnostics' && m.params.uri === pathToUri(lakeFile), 5000, 'lake diagnostics');
     await c.waitFor((m) => m.method === 'textDocument/publishDiagnostics' && m.params.uri === pathToUri(soloFile), 5000, 'standalone diagnostics');
+    // …minus the build-progress lines, which describe the build and not the file
+    assert.deepEqual(d1.params.diagnostics.map((d) => d.message.slice(0, 4)), ['mock']);
   } finally { c.kill(); }
 });
 
@@ -439,11 +495,68 @@ leanTest('lean-goal try: a candidate that is itself a sorry does not count as pr
   assert.match(r.stdout, /still discharged by a `sorry`/);
 });
 
-leanTest('lean-goal try: refuses a position with no sorry, pointing at the fix', () => {
-  const r = leanGoal(['try', `${BAD_LEAN}:1`, 'rfl']);
-  assert.notEqual(r.status, 0);
-  assert.match(r.stderr, /no `sorry` on line 1/);
+leanTest('lean-goal try: on a line without a sorry it replaces the tactic there', () => {
+  // bad.lean: `example : 1 = 2 := rfl` — the whole line is the failing candidate.
+  const before = fs.readFileSync(BAD_LEAN, 'utf8');
+  const r = leanGoal(['try', `${BAD_LEAN}:1`, 'example : 2 = 2 := rfl']);
+  assert.equal(r.status, 0, `exit 0, stdout: ${r.stdout} stderr: ${r.stderr}`);
+  assert.match(r.stdout, /example : 1 = 2 := rfl ⟶/);
+  assert.match(r.stdout, /resolves 1 error/);
+  assert.equal(fs.readFileSync(BAD_LEAN, 'utf8'), before, 'file untouched without --apply');
+  const bad = leanGoal(['try', `${BAD_LEAN}:1`, 'example : 1 = 2 := by decide']);
+  assert.equal(bad.status, 1, `a wrong replacement still fails: ${bad.stdout}`);
 });
+
+leanTest('lean-goal try --apply: writes a working candidate to disk', () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'lean-goal-apply-')), 'Apply.lean');
+  fs.writeFileSync(f, 'example : 1 + 1 = 2 := by\n  sorry\n');
+  const r = leanGoal(['try', '--apply', `${f}:2`, 'rfl']);
+  assert.equal(r.status, 0, `exit 0, stdout: ${r.stdout} stderr: ${r.stderr}`);
+  assert.equal(fs.readFileSync(f, 'utf8'), 'example : 1 + 1 = 2 := by\n  rfl\n');
+});
+
+leanTest('lean-goal check --errors-only --compact: one line per error, nothing else', () => {
+  const r = leanGoal(['check', '--errors-only', '--compact', BAD_LEAN]);
+  assert.equal(r.status, 1);
+  const lines = r.stdout.split('\n').filter((l) => /^\s+error /.test(l));
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /^\s+error .*bad\.lean:1:\d+: /);
+  assert.ok(!/warning /.test(r.stdout));
+});
+
+const haveLake = !!resolveToolchain(process.env).lake;
+const toolchainFile = (() => {
+  // A pinned toolchain keeps the test off elan's network path; use one that
+  // is already installed, if any.
+  try {
+    const dir = path.join(process.env.ELAN_HOME || path.join(os.homedir(), '.elan'), 'toolchains');
+    const names = fs.readdirSync(dir).filter((n) => /^leanprover--lean4---v/.test(n)).sort();
+    return names.length ? names[names.length - 1].replace('leanprover--lean4---', 'leanprover/lean4:') : null;
+  } catch { return null; }
+})();
+
+test('lean-goal check: an edit to an imported module is seen by the importer', haveLake && toolchainFile ? () => {
+  // The failure this guards: the daemon keeps the importer open, the server
+  // re-reads its imports only on open, and a constant defined and built ten
+  // seconds ago is reported as unknown for the rest of the session.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lean-goal-reload-'));
+  fs.writeFileSync(path.join(root, 'lakefile.toml'), 'name = "reloadtest"\n[[lean_lib]]\nname = "R"\n');
+  fs.writeFileSync(path.join(root, 'lean-toolchain'), `${toolchainFile}\n`);
+  fs.mkdirSync(path.join(root, 'R'));
+  fs.writeFileSync(path.join(root, 'R', 'A.lean'), 'def a : Nat := 1\n');
+  const importer = path.join(root, 'R', 'B.lean');
+  fs.writeFileSync(importer, 'import R.A\n#check b\n');
+  const r1 = leanGoal(['check', importer], { timeout: 180000 });
+  assert.match(r1.stdout, /nknown identifier .b./, `first check sees no b: ${r1.stdout} ${r1.stderr}`);
+  // Define `b` in the import. The daemon still holds B.lean open.
+  fs.writeFileSync(path.join(root, 'R', 'A.lean'), 'def a : Nat := 1\ndef b : Nat := 2\n');
+  const r2 = leanGoal(['check', importer], { timeout: 180000 });
+  assert.equal(r2.status, 0, `second check must see b: ${r2.stdout} ${r2.stderr}`);
+  assert.match(r2.stdout, /reloaded them before answering/);
+  assert.ok(!/nknown identifier/.test(r2.stdout));
+  leanGoal(['stop']);
+  fs.rmSync(root, { recursive: true, force: true });
+} : () => { console.log('        (skipped: no lake toolchain)'); });
 
 leanTest('lean-goal cmd: runs a command in the file\'s import context', () => {
   const r = leanGoal(['cmd', C_LEAN, '#check Nat.succ']);
