@@ -80,13 +80,16 @@ A bundled skill (`lean-interactive-proving`) teaches Claude the workflow: get th
 | `LEAN4_LSP_MAX_COMPLETIONS` / `LEAN4_LSP_MAX_HINT_LINES` | Result caps for `search` / `hint` (default 40 / 24) |
 | `LEAN4_LSP_SILENCE_MS` | Fallback elaboration-quiet window for servers that never report progress (default 5 s) |
 | `LEAN4_LSP_KEEP_BUILD_INFO=1` | Keep Lake's build-progress info diagnostics instead of filtering them |
+| `LEAN4_LSP_MAX_OPEN` | Documents the Lean servers hold open at once, least recently used closed first (default 8, `0` = no cap) |
+| `LEAN4_LSP_DOC_IDLE_MS` | Close a document on the Lean side after this long untouched (default 15 min, `0` = never) |
+| `LEAN4_LSP_SERVER_IDLE_MS` | Stop a server that has held no document for this long (default 10 min, `0` = never) |
 
 ## Notes
 
 - **Cold start**: the Lean watchdog loads its `.ilean` index asynchronously (5–20 s for a Mathlib-sized workspace), during which definition/symbol queries would return empty. The proxy absorbs this by retrying empty results while a server is younger than 45 s — so go-to-definition into Mathlib and `workspaceSymbol` across dependencies work from the first query.
-- **Memory**: each project's server can use significant RAM (Mathlib: several GB). `lean-goal stop` and closing the session both free it.
+- **Memory**: every document open on a Lean server is a `lean --worker` process — about 2 GB once Mathlib is imported — and each project (each git worktree, too) gets its own server of a GB or more. Claude Code opens a document on every Read or Edit of a `.lean` file and closes one only once more than 50 are open, which left long multi-worktree sessions holding dozens of workers. The proxy therefore keeps its own copy of each document and bounds what the Lean side holds: at most `LEAN4_LSP_MAX_OPEN` documents, idle ones closed, idle servers stopped, and a server whose project directory was deleted (a removed worktree) stopped at once. A closed document still counts as open for Claude Code; its next request or edit reopens it from the proxy's copy, which costs re-elaborating that one file (seconds when its imports are already loaded). `lean-goal stop` frees the `lean-goal` daemons; closing the session frees everything.
 - **Final verification**: the language server reflects live editor state; `lake build` remains the ground truth for CI-grade acceptance.
-- **Development**: `node test/run-tests.mjs` runs the full suite (framing, root detection, proxy routing, and live `lean-goal` tests when a toolchain is installed).
+- **Development**: `node test/run-tests.mjs` runs the full suite (framing, root detection, proxy routing and memory bounds, and live `lean-goal` tests when a toolchain is installed). `node test/e2e-memory.mjs` checks the memory bounds against a real Lean server by counting its processes; given three `.lean` files of one project it checks eviction on those.
 
 ## License
 

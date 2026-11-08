@@ -410,3 +410,30 @@ export function uriToPath(uri) {
 export function pathToUri(p) {
   return 'file://' + path.resolve(p).split(path.sep).map(encodeURIComponent).join('/');
 }
+
+/**
+ * Apply LSP `contentChanges` to `text`: a change without a range replaces
+ * the whole document, a ranged one splices. LSP positions count UTF-16 code
+ * units, which is what JS string indices are, so no transcoding is needed.
+ */
+export function applyContentChanges(text, changes) {
+  for (const ch of changes || []) {
+    if (!ch.range) { text = ch.text; continue; }
+    const start = lspOffset(text, ch.range.start);
+    const end = Math.max(start, lspOffset(text, ch.range.end));
+    text = text.slice(0, start) + ch.text + text.slice(end);
+  }
+  return text;
+}
+
+/** 0-based LSP (line, character) → offset, clamped to the line and the text. */
+function lspOffset(text, pos) {
+  let off = 0;
+  for (let l = 0; l < pos.line; l++) {
+    const nl = text.indexOf('\n', off);
+    if (nl < 0) return text.length;
+    off = nl + 1;
+  }
+  const eol = text.indexOf('\n', off);
+  return Math.min(off + pos.character, eol < 0 ? text.length : eol);
+}

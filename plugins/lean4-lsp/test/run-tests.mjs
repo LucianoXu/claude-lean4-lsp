@@ -19,7 +19,7 @@ function test(name, fn) { tests.push({ name, fn }); }
 const {
   findLakeRoot, resolveToolchain, LspFramer, frameMessage,
   scanSorries, spliceSorry, rankNames, condenseSignature, moduleNameFor, truncate,
-  projectImports, importClosureStamp, spliceLine, stripTrace, isBuildNoise,
+  projectImports, importClosureStamp, spliceLine, stripTrace, isBuildNoise, applyContentChanges,
 } = await import('../bin/lean-lsp-lib.mjs');
 
 test('findLakeRoot: file inside a Lake project resolves to project root', () => {
@@ -238,7 +238,7 @@ test('moduleNameFor: refuses paths no target of this package covers', () => {
 
 // ---------------------------------------------------------------- proxy tests
 
-import { LspTestClient } from './helpers.mjs';
+import { LspTestClient, sleep } from './helpers.mjs';
 import { pathToUri } from '../bin/lean-lsp-lib.mjs';
 
 const PROXY = path.join(__dirname, '..', 'bin', 'lsp-proxy.mjs');
@@ -407,6 +407,149 @@ test('proxy: clean shutdown/exit terminates proxy and servers', async () => {
     const code = await Promise.race([c.exited, new Promise((r) => setTimeout(() => r('timeout'), 5000))]);
     assert.equal(code, 0, 'proxy exited cleanly');
   } finally { c.kill(); }
+});
+
+// What the Lean side holds. Each open document is a worker process (~2 GiB
+// with Mathlib); Claude Code closes documents only past 50, so the proxy
+// bounds it. The mock logs open/change/close/exit to $MOCK_EVENTS.
+
+function eventClient(extraEnv = {}) {
+  const eventsFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'lean-lsp-events-')), 'events.jsonl');
+  const c = mockClient({ MOCK_EVENTS: eventsFile, ...extraEnv });
+  c.events = () => {
+    try { return fs.readFileSync(eventsFile, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse); }
+    catch { return []; }
+  };
+  c.waitEvent = async (pred, ms = 5000, what = 'event') => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms) {
+      const hit = c.events().find(pred);
+      if (hit) return hit;
+      await sleep(50);
+    }
+    throw new Error(`timeout waiting for ${what}; events: ${JSON.stringify(c.events())}\nstderr:\n${c.stderr}`);
+  };
+  return c;
+}
+
+const synthDoc = (rel, text, version = 1) => ({
+  textDocument: { uri: pathToUri(path.join(FIXTURES, rel)), languageId: 'lean', version, text },
+});
+const symbols = (c, rel) => c.request('textDocument/documentSymbol',
+  { textDocument: { uri: pathToUri(path.join(FIXTURES, rel)) } }, 5000);
+const unexpectedExit = (c) => c.messages.some((m) => m.method === 'window/showMessage'
+  && /exited unexpectedly/.test(m.params.message));
+
+test('applyContentChanges: full replacement and ranged splices (UTF-16 positions)', () => {
+  assert.equal(applyContentChanges('abc', [{ text: 'xyz' }]), 'xyz');
+  const t = 'line one\nline two\nline three';
+  assert.equal(applyContentChanges(t, [{ range: { start: { line: 1, character: 5 }, end: { line: 1, character: 8 } }, text: '2' }]),
+    'line one\nline 2\nline three');
+  assert.equal(applyContentChanges(t, [{ range: { start: { line: 0, character: 4 }, end: { line: 2, character: 4 } }, text: '' }]),
+    'line three');
+  // α is one UTF-16 unit, 𝔽 is two
+  assert.equal(applyContentChanges('α𝔽x', [{ range: { start: { line: 0, character: 3 }, end: { line: 0, character: 4 } }, text: 'y' }]), 'α𝔽y');
+  // several changes apply in order, each against the previous result
+  assert.equal(applyContentChanges('ab', [
+    { range: { start: { line: 0, character: 2 }, end: { line: 0, character: 2 } }, text: '\nc' },
+    { range: { start: { line: 1, character: 0 }, end: { line: 1, character: 1 } }, text: 'C' },
+  ]), 'ab\nC');
+});
+
+test('proxy: holds at most LEAN4_LSP_MAX_OPEN documents on the Lean side, reopening on demand', async () => {
+  const c = eventClient({ LEAN4_LSP_MAX_OPEN: '2' });
+  try {
+    await c.request('initialize', { processId: null, rootUri: pathToUri(FIXTURES), capabilities: {} }, 5000);
+    c.notify('initialized', {});
+    for (const n of [1, 2, 3]) {
+      c.notify('textDocument/didOpen', synthDoc(`lakeproj/Lakeproj/X${n}.lean`, `x${n}`));
+      await symbols(c, `lakeproj/Lakeproj/X${n}.lean`);
+      await sleep(20);
+    }
+    const x1 = pathToUri(path.join(FIXTURES, 'lakeproj/Lakeproj/X1.lean'));
+    const x2 = pathToUri(path.join(FIXTURES, 'lakeproj/Lakeproj/X2.lean'));
+    const x3 = pathToUri(path.join(FIXTURES, 'lakeproj/Lakeproj/X3.lean'));
+    await c.waitEvent((e) => e.event === 'close' && e.uri === x1, 5000, 'X1 closed as least recently used');
+    assert.ok(!c.events().some((e) => e.event === 'close' && e.uri !== x1), 'only X1 closed');
+    // The client still has X1 open: a request on it reopens it transparently.
+    const r = await symbols(c, 'lakeproj/Lakeproj/X1.lean');
+    assert.ok(!r.error, `request on an evicted document answered: ${JSON.stringify(r.error)}`);
+    assert.equal(c.events().filter((e) => e.event === 'open' && e.uri === x1).length, 2, 'X1 reopened');
+    await c.waitEvent((e) => e.event === 'close' && e.uri === x2, 5000, 'X2 now the one closed');
+    await sleep(20);
+    // An edit to an evicted document reopens it with the edited text.
+    c.notify('textDocument/didChange', { textDocument: { uri: x2, version: 7 }, contentChanges: [{ text: 'x2 edited' }] });
+    const reopened = await c.waitEvent((e) => e.event === 'open' && e.uri === x2 && e.text === 'x2 edited', 5000, 'X2 reopened with its new text');
+    assert.equal(reopened.version, 7);
+    await c.waitEvent((e) => e.event === 'close' && e.uri === x3, 5000, 'X3 closed in turn');
+    // An edit to a held document is forwarded as an edit, not a reopen.
+    c.notify('textDocument/didChange', { textDocument: { uri: x2, version: 8 }, contentChanges: [{ text: 'x2 again' }] });
+    await c.waitEvent((e) => e.event === 'change' && e.uri === x2 && e.text === 'x2 again', 5000, 'change forwarded');
+    assert.equal(launches(c).length, 1, 'one server throughout');
+    // The empty diagnostics a server publishes on close never reach the client.
+    await sleep(100);
+    assert.ok(!c.messages.some((m) => m.method === 'textDocument/publishDiagnostics' && m.params.diagnostics.length === 0),
+      'no stale "no errors" for documents the client still has open');
+  } finally { c.kill(); }
+});
+
+test('proxy: a client didClose of an evicted document is not forwarded', async () => {
+  const c = eventClient({ LEAN4_LSP_MAX_OPEN: '1' });
+  try {
+    await c.request('initialize', { processId: null, rootUri: pathToUri(FIXTURES), capabilities: {} }, 5000);
+    c.notify('initialized', {});
+    c.notify('textDocument/didOpen', synthDoc('lakeproj/Lakeproj/X1.lean', 'x1'));
+    await symbols(c, 'lakeproj/Lakeproj/X1.lean');
+    await sleep(20);
+    c.notify('textDocument/didOpen', synthDoc('lakeproj/Lakeproj/X2.lean', 'x2'));
+    await symbols(c, 'lakeproj/Lakeproj/X2.lean');
+    const x1 = pathToUri(path.join(FIXTURES, 'lakeproj/Lakeproj/X1.lean'));
+    await c.waitEvent((e) => e.event === 'close' && e.uri === x1);
+    c.notify('textDocument/didClose', { textDocument: { uri: x1 } });
+    await symbols(c, 'lakeproj/Lakeproj/X2.lean'); // a round trip after the didClose
+    assert.equal(c.events().filter((e) => e.event === 'close' && e.uri === x1).length, 1, 'closed once, by the proxy');
+  } finally { c.kill(); }
+});
+
+test('proxy: closes idle documents, stops the idle server, restarts both on next use', async () => {
+  const c = eventClient({ LEAN4_LSP_DOC_IDLE_MS: '300', LEAN4_LSP_SERVER_IDLE_MS: '300', LEAN4_LSP_SWEEP_MS: '100' });
+  try {
+    await c.request('initialize', { processId: null, rootUri: pathToUri(FIXTURES), capabilities: {} }, 5000);
+    c.notify('initialized', {});
+    c.notify('textDocument/didOpen', synthDoc('lakeproj/Lakeproj/X1.lean', 'x1'));
+    await symbols(c, 'lakeproj/Lakeproj/X1.lean');
+    const x1 = pathToUri(path.join(FIXTURES, 'lakeproj/Lakeproj/X1.lean'));
+    await c.waitEvent((e) => e.event === 'close' && e.uri === x1, 5000, 'idle document closed');
+    const ex = await c.waitEvent((e) => e.event === 'exit', 5000, 'idle server stopped');
+    assert.equal(ex.how, 'exit', 'stopped by LSP shutdown/exit, not killed');
+    assert.ok(!unexpectedExit(c), 'a deliberate stop is not reported as a crash');
+    const r = await symbols(c, 'lakeproj/Lakeproj/X1.lean');
+    assert.ok(!r.error, `answered after restart: ${JSON.stringify(r.error)}`);
+    assert.equal(launches(c).length, 2, 'server restarted on demand');
+    assert.equal(c.events().filter((e) => e.event === 'open' && e.uri === x1 && e.text === 'x1').length, 2);
+  } finally { c.kill(); }
+});
+
+test('proxy: stops the server of a deleted project directory, and fails fast on its files', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lean-lsp-worktree-'));
+  fs.writeFileSync(path.join(root, 'lakefile.toml'), 'name = "wt"\n');
+  fs.mkdirSync(path.join(root, 'Wt'));
+  const file = path.join(root, 'Wt', 'F.lean');
+  const uri = pathToUri(file);
+  const c = eventClient({ LEAN4_LSP_SWEEP_MS: '100' });
+  try {
+    await c.request('initialize', { processId: null, rootUri: pathToUri(FIXTURES), capabilities: {} }, 5000);
+    c.notify('initialized', {});
+    c.notify('textDocument/didOpen', { textDocument: { uri, languageId: 'lean', version: 1, text: 'f' } });
+    await c.request('textDocument/documentSymbol', { textDocument: { uri } }, 5000);
+    fs.rmSync(root, { recursive: true, force: true });
+    const ex = await c.waitEvent((e) => e.event === 'exit', 5000, 'server of the deleted directory stopped');
+    assert.equal(ex.cwd, root);
+    assert.ok(!unexpectedExit(c), 'not reported as a crash');
+    const r = await c.request('textDocument/documentSymbol', { textDocument: { uri } }, 5000);
+    assert.match(r.error && r.error.message, /deleted/, 'request on a vanished file fails with the reason');
+    assert.equal(launches(c).length, 1, 'no server spawned for the vanished path');
+  } finally { c.kill(); fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 // ------------------------------------------------------------ lean-goal tests
